@@ -1,0 +1,32 @@
+# Gabagool v2 — default configuration
+# Credentials come from environment variables (.env), never from this file.
+#   POLY_PRIVATE_KEY, POLY_WALLET, POLY_RELAYER_API_KEY, POLY_RELAYER_API_KEY_ADDRESS
+
+dry_run: true          # main.py --live overrides; keep true here as a safety default
+heartbeat: true        # V2 dead-man's switch: orders auto-cancel if the bot dies
+db_path: data/gabagool_v2.sqlite
+log_level: INFO
+
+clob:
+  signature_type: 3     # 3=POLY_1271 (Deposit Wallet); 1=Proxy; 2=Safe; 0=EOA
+
+strategy:
+  combined_budget: 0.97        # max sum of our two bids; 1.00 − this = gross margin/pair
+  requote_drift: 0.02
+  requote_interval_s: 3.0
+  stop_posting_buffer_s: 75    # cancel + final merge this long before window end
+  imbalance_pause_at: 0.15     # pause heavy side beyond 15% share imbalance…
+  imbalance_resume_at: 0.06    # …resume under 6% (hysteresis)
+  imbalance_min_gap_shares: 10
+  rung_dollar_target: 4.0
+  max_shares_per_side: 500
+  min_pairs_to_merge: 5        # merge as soon as ≥5 matched pairs exist on-chain
+  merge_interval_s: 20
+  assets: [btc, eth]
+
+capital:
+  per_window_cap_usd: 50
+  global_exposure_cap_usd: 150
+  max_concurrent_windows: 2
+  session_drawdown_kill: 0.10  # halt + cancel-all if cash equity drops 10%
+  min_starting_pusd: 17

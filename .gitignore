@@ -1,0 +1,15 @@
+.env
+.merge_proof
+data/
+*.pyc
+__pycache__/
+.DS_Store
+venv/
+*.sqlite
+cli
+cli-dev
+dist/
+*.o
+*.hi
+*.hs
+the final-History-2026-06-10.csv

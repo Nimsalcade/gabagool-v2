@@ -1,0 +1,5 @@
+# Verified working set, June 2026
+polymarket-client>=0.1.0b5     # official unified SDK: orders, books, gasless split/merge/redeem
+py-clob-client-v2>=0.1         # heartbeat sidecar (dead-man's switch) — same creds
+pyyaml>=6.0
+pytest>=8.0
