@@ -88,6 +88,8 @@ class CapitalConfig:
     session_drawdown_kill: float = 0.10
     # Refuse to start live if pUSD balance is below this.
     min_starting_pusd: float = 20.0
+    # pUSD to leave in the wallet when harvesting profit. 0 = use min_starting_pusd.
+    harvest_floor_usd: float = 0.0
 
     def validate(self) -> None:
         if self.per_window_cap_usd <= 0 or self.global_exposure_cap_usd <= 0:

@@ -30,3 +30,4 @@ capital:
   max_concurrent_windows: 2
   session_drawdown_kill: 0.10  # halt + cancel-all if cash equity drops 10%
   min_starting_pusd: 17
+  harvest_floor_usd: 30         # leave this much pUSD in wallet; withdraw the rest

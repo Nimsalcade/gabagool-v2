@@ -1,4 +1,4 @@
-.PHONY: install test dry check merge-proof live cancel positions redeem
+.PHONY: install test dry check merge-proof live cancel positions redeem harvest
 
 install:
 	pip install -r requirements.txt
@@ -26,3 +26,6 @@ positions:
 
 redeem:
 	python -m tools.redeem_all
+
+harvest:
+	python -m tools.harvest --merge
