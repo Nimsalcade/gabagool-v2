@@ -219,8 +219,8 @@ class MakerLoop:
         effective_other = other_resting
         if effective_other is None:
             other_leg = self.tracker.down if side == "UP" else self.tracker.up
-            if other_leg.shares > 0 and other_leg.cost > 0:
-                effective_other = other_leg.cost / other_leg.shares
+            if other_leg.shares > 0 and other_leg.max_price > 0:
+                effective_other = other_leg.max_price
             else:
                 effective_other = other_target
         price = cap_against_resting(
@@ -348,6 +348,8 @@ class MakerLoop:
                     tot = self.tracker.up if side == "UP" else self.tracker.down
                     tot.shares += o.shares
                     tot.cost += o.shares * o.price
+                    if o.price > tot.max_price:
+                        tot.max_price = o.price
                     self.log.info("[dry] FILL %s %.0f sh @ %.3f", side, o.shares, o.price)
                     sq.order_id, sq.price = None, None
         return (u, d)

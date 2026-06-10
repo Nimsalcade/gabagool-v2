@@ -51,6 +51,7 @@ class TrackedOrder:
 class SideTotals:
     shares: float = 0.0
     cost: float = 0.0
+    max_price: float = 0.0
 
     @property
     def avg_price(self) -> float:
@@ -123,6 +124,8 @@ class FillTracker:
                 tot = self.up if o.side == "UP" else self.down
                 tot.shares += delta
                 tot.cost += delta * o.price
+                if o.price > tot.max_price:
+                    tot.max_price = o.price
                 new_notional += delta * o.price
                 log.info(
                     "FILL %s %s %.0f sh @ %.3f (order %s)",
