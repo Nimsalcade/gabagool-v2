@@ -78,12 +78,10 @@ The sample also does not reveal the policy governing:
 * merge timing.
 
 Consequently, this repository's post-only GTC orders, fair-split targets,
-equal share sizing for newly offered legs, combined-budget cap, imbalance
-thresholds, and merge cadence are **replica implementation choices**, not
-measured gabagool22 parameters. Tests assert the safety properties of those
-choices; they do not turn those policies into forensic facts. Equal fresh-order
-sizing prevents the bot itself from creating a dollar-sized quantity skew, but
-fills remain asynchronous and realized inventory is allowed to be unequal.
+combined-budget cap, imbalance thresholds, and merge cadence are **replica
+implementation choices**, not measured gabagool22 parameters. Tests may assert
+the safety properties of those choices, but must not present equal fresh-pair
+sizes or a strict per-quote $0.97 pairing rule as forensic ground truth.
 
 ## Locked statement
 

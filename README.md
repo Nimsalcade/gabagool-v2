@@ -15,10 +15,6 @@ imbalance thresholds, and merge cadence are implementation choices rather than
 measured parameters. See [`STRATEGY.md`](STRATEGY.md) for the locked evidence
 baseline, including the 734 15-minute / 182 hourly market split, 94.7% aggregate
 matchability, MERGE plus REDEEM exits, and corrected pair-count arithmetic.
-Fresh UP and DOWN orders use one common **share count** (rather than equal dollar
-notionals), because shares are the unit consumed by a complete-set merge. This
-is an inventory-discipline rule, not a claim that fills arrive atomically or
-that every resulting market position will be exactly balanced.
 
 ---
 
