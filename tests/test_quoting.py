@@ -11,6 +11,7 @@ from src.quoting import (  # noqa: E402
     imbalance_fraction,
     round_pairs_to_micro,
     should_requote,
+    size_pair_for_prices,
     size_for_price,
     tick_floor,
 )
@@ -72,6 +73,15 @@ def test_sizing_respects_all_floors():
     assert size_for_price(0.05, 0.5, 5, 1.0) == 20
     # dollar target dominates when above floors: $4 / 0.40 = 10
     assert size_for_price(0.40, 4.0, 5, 1.0) == 10
+
+
+def test_fresh_pair_uses_one_share_count_not_equal_dollars():
+    # Independent $4 sizing would produce 20 UP versus 5 DOWN. Complete sets
+    # are share-matched, so both fresh orders instead use the stricter count.
+    shares = size_pair_for_prices(0.20, 0.77, 4.0, 5, 1.0)
+    assert shares == 20
+    assert shares * 0.20 >= 1.0
+    assert shares * 0.77 >= 1.0
 
 
 def test_requote_logic():

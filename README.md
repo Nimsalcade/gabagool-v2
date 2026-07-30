@@ -98,7 +98,7 @@ src/constants.py      verified V2 addresses & platform limits (single source)
 src/config.py         typed config; live mode fails fast on malformed creds
 src/sdk.py            client factory: gasless wallet binding + approvals
 src/discovery.py      deterministic {asset}-updown-15m-{epoch} slugs + gating
-src/quoting.py        pure math: budget-capped fair-split bids (unit-tested)
+src/quoting.py        pure math: budget-capped bids + share-matched sizing
 src/fills.py          fill truth: size_matched + trades API; cancels ≠ fills
 src/inventory.py      on-chain position truth (Data API)
 src/merge_engine.py   gasless merge, chain-verified, error-classified
