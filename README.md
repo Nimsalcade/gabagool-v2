@@ -4,10 +4,17 @@ A complete rewrite of the previous bot, built on Polymarket's **current (V2,
 post-April 2026)** platform: pUSD collateral, CTF Exchange V2, gasless relayer
 transactions, and the official unified `polymarket-client` SDK.
 
-It does exactly one thing, the thing gabagool22 does: rest passive bids on
-**both** sides of every 15-minute BTC/ETH Up-or-Down window so the pair costs
-less than $1.00 combined, then **merge** matched pairs back into $1.00 of pUSD
-on-chain, continuously. No price prediction exists anywhere in this codebase.
+It implements one conservative replica of gabagool22's economic engine: acquire
+**both** outcomes, merge matched complete sets back into $1.00 of pUSD, and
+redeem winning residual inventory after resolution. No price prediction exists
+anywhere in this codebase.
+
+The forensic record does **not** establish this replica's exact quoting policy.
+In particular, post-only GTC, fair-split prices, a strict per-quote $0.97 cap,
+imbalance thresholds, and merge cadence are implementation choices rather than
+measured parameters. See [`STRATEGY.md`](STRATEGY.md) for the locked evidence
+baseline, including the 734 15-minute / 182 hourly market split, 94.7% aggregate
+matchability, MERGE plus REDEEM exits, and corrected pair-count arithmetic.
 
 ---
 
@@ -34,15 +41,18 @@ They were either the cause of losses or dead weight around it.
 ## How money flows
 
 ```
-pUSD ──(passive BUY bids ≤ $0.97 combined)──▶ Up + Down shares
+pUSD ──(small BUY fills arriving asynchronously)──▶ Up + Down shares
  ▲                                                   │
  └────────── merge_positions (gasless) ◀── matched pairs = locked $1.00
                        │
               naked remainder (≤ a few %) ──▶ redeemed after resolution
 ```
 
-Gross edge = `1.00 − combined entry` per pair (default budget 0.97 ⇒ ≥3¢),
-realized only when the merge lands. That's why `--live` is **gated on a real
+For each matched pair, gross edge = `1.00 − quantity-weighted acquisition
+cost`; the replica's default quote budget is 0.97. Actual session PnL must also
+include unmatched residuals and redemptions and is derived from the ledger, not
+from a headline VWAP multiplication. The edge is realized only when the merge
+lands. That's why `--live` is **gated on a real
 on-chain merge proof** (see Quickstart step 4).
 
 ---
