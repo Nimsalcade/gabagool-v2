@@ -74,6 +74,14 @@ def test_sizing_respects_all_floors():
     assert size_for_price(0.40, 4.0, 5, 1.0) == 10
 
 
+def test_each_side_sizes_independently_by_price():
+    # Separate queues fill asynchronously. A shared fresh quantity would not
+    # make the resulting inventory atomic or equal, so each quote keeps its
+    # own exchange-compliant dollar target.
+    assert size_for_price(0.20, 4.0, 5, 1.0) == 20
+    assert size_for_price(0.77, 4.0, 5, 1.0) == 6
+
+
 def test_requote_logic():
     assert should_requote(None, 0.45, 0.02)
     assert not should_requote(0.45, 0.46, 0.02)   # within drift: keep queue spot

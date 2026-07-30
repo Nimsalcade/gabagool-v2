@@ -187,7 +187,9 @@ class MakerLoop:
             return
         target_up, target_down = targets
 
-        # 5) re-quote each unpaused side that drifted
+        # 5) Re-quote each side independently. Fills are asynchronous and may
+        # be partial, so equal fresh order quantities would not guarantee equal
+        # holdings and would unnecessarily couple two independent queues.
         await self._requote("UP", self.market.up_token_id, target_up, target_down)
         await self._requote("DOWN", self.market.down_token_id, target_down, target_up)
 
@@ -200,7 +202,9 @@ class MakerLoop:
         await self.merges.merge_condition(self.market.condition_id, force=True)
 
     # ============================================================== quoting
-    async def _requote(self, side: str, token_id: str, my_target: float, other_target: float) -> None:
+    async def _requote(
+        self, side: str, token_id: str, my_target: float, other_target: float
+    ) -> None:
         sq = self._sides[side]
         if sq.paused or not self.backoff.ready(f"post:{side}"):
             return
