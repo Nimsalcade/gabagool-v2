@@ -39,6 +39,7 @@ from .quoting import (
     fair_split_bids,
     imbalance_fraction,
     should_requote,
+    size_pair_for_prices,
     size_for_price,
 )
 
@@ -187,9 +188,24 @@ class MakerLoop:
             return
         target_up, target_down = targets
 
-        # 5) re-quote each unpaused side that drifted
-        await self._requote("UP", self.market.up_token_id, target_up, target_down)
-        await self._requote("DOWN", self.market.down_token_id, target_down, target_up)
+        # 5) Size in shares, because one UP share + one DOWN share is the unit
+        # that merges. Orders still fill asynchronously; equality here avoids
+        # creating a systematic imbalance by sizing both legs to equal dollars.
+        pair_shares = size_pair_for_prices(
+            target_up,
+            target_down,
+            cfg.rung_dollar_target,
+            self._min_shares,
+            MIN_ORDER_NOTIONAL_USD,
+        )
+
+        # 6) re-quote each unpaused side that drifted
+        await self._requote(
+            "UP", self.market.up_token_id, target_up, target_down, pair_shares
+        )
+        await self._requote(
+            "DOWN", self.market.down_token_id, target_down, target_up, pair_shares
+        )
 
         await asyncio.sleep(cfg.requote_interval_s)
 
@@ -200,7 +216,14 @@ class MakerLoop:
         await self.merges.merge_condition(self.market.condition_id, force=True)
 
     # ============================================================== quoting
-    async def _requote(self, side: str, token_id: str, my_target: float, other_target: float) -> None:
+    async def _requote(
+        self,
+        side: str,
+        token_id: str,
+        my_target: float,
+        other_target: float,
+        pair_shares: float,
+    ) -> None:
         sq = self._sides[side]
         if sq.paused or not self.backoff.ready(f"post:{side}"):
             return
@@ -231,8 +254,17 @@ class MakerLoop:
         if not should_requote(sq.price if sq.order_id else None, price, cfg.requote_drift):
             return
 
-        shares = size_for_price(
-            price, cfg.rung_dollar_target, self._min_shares, MIN_ORDER_NOTIONAL_USD
+        # A stale opposite order can force this side below its fresh target.
+        # Preserve exchange minima at the final capped price even when that
+        # exceptional constraint requires more than the planned pair size.
+        shares = max(
+            pair_shares,
+            size_for_price(
+                price,
+                cfg.rung_dollar_target,
+                self._min_shares,
+                MIN_ORDER_NOTIONAL_USD,
+            ),
         )
         notional = price * shares
         if not self.capital.can_commit(self.tracker.total_cost(),

@@ -161,6 +161,34 @@ def size_for_price(
     return float(int(shares))
 
 
+def size_pair_for_prices(
+    up_price: float,
+    down_price: float,
+    rung_dollar_target: float,
+    min_order_shares: float,
+    min_notional: float,
+) -> float:
+    """Return one share count that is valid for both outcome orders.
+
+    Complete sets merge by *share count*, not by dollars.  Sizing each side
+    independently to the same dollar notional makes the cheaper outcome much
+    larger and manufactures imbalance before any fill has occurred.  Use the
+    larger of the two sides' exchange-compliant sizes so either order can rest
+    while every fresh quoting cycle offers equal potential pair inventory.
+
+    The fills remain asynchronous: this function does not pretend the two
+    orders are atomic, nor does it require the resulting holdings to be equal.
+    """
+    return max(
+        size_for_price(
+            up_price, rung_dollar_target, min_order_shares, min_notional
+        ),
+        size_for_price(
+            down_price, rung_dollar_target, min_order_shares, min_notional
+        ),
+    )
+
+
 def should_requote(resting_price: float | None, target_price: float, drift: float) -> bool:
     """Keep a well-priced resting order (queue position is valuable);
     replace it only when it has drifted from target."""
