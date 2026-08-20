@@ -67,9 +67,10 @@ class FillTracker:
         return max(prices) if prices else None
 
     def resting_notional(self) -> float:
+        # FAK taker orders cannot persist on the book and must not reserve resting capital.
         return sum(
             o.price * max(0.0, o.shares - o.filled)
-            for o in self.orders.values() if o.open
+            for o in self.orders.values() if o.open and o.mode == "maker"
         )
 
     def open_order_ids(self) -> list[str]:
@@ -102,12 +103,16 @@ class FillTracker:
             if not o.open:
                 continue
             if o.order_id in open_ids:
-                target = min(open_matched.get(o.order_id, o.filled), o.shares)
+                matched = open_matched.get(o.order_id, o.filled)
+                target = matched if o.mode == "taker" else min(matched, o.shares)
             else:
-                target = min(traded.get(o.order_id, o.filled), o.shares)
+                matched = traded.get(o.order_id, o.filled)
+                # BUY market/FAK amount is specified in collateral, so actual shares can
+                # exceed the planning estimate when execution improves on max_price.
+                target = matched if o.mode == "taker" else min(matched, o.shares)
                 o.open = False
                 if target == 0 and o.filled == 0:
-                    log.debug("order %s cancelled unfilled", o.order_id[:10])
+                    log.debug("order %s cancelled/unfilled", o.order_id[:10])
 
             delta = target - o.filled
             if delta > 1e-9:
@@ -115,6 +120,8 @@ class FillTracker:
                 tot = self.up if o.side == "UP" else self.down
                 tot.shares += delta
                 tot.cost += delta * o.price
+                # price is the maker limit / taker max-price planning value. Exact
+                # taker execution economics are reconciled from trade rows below.
                 tot.max_price = max(tot.max_price, o.price)
                 tot.last_fill_ts = time.time()
                 new_notional += delta * o.price
