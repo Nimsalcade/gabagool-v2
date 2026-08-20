@@ -1,16 +1,17 @@
 """Forensic-calibrated execution policy for Gabagool-style complete-set accumulation.
 
-This module deliberately separates *measured behavior* from still-unknown quote placement.
-The full historical decode establishes a maker-dominant mixed execution engine, tight
-terminal inventory balance, continued quoting to the final seconds, and aggregate cost-
-basis control. It does not reveal cancelled quotes or exact queue placement.
+This module encodes only behavior supported by the completed execution reconstruction:
+- BUY both complementary outcomes;
+- maker-dominant execution with selective taker repair;
+- aggregate cost-basis control instead of a fixed per-quote pair cap;
+- tighter maker skew as inventory departs from 1:1;
+- taker use concentrated on deficient-leg repair, not generic edge chasing;
+- aggressive clip size capped by the actual inventory deficit to avoid oscillation;
+- taker urgency rises with imbalance/staleness and falls into expiry;
+- 5-40 share clips centered on the observed 10-20 share regime.
 
-The functions here therefore encode only defensible controls:
-- aggregate UP/DOWN VWAP guard, not a per-quote fixed pair budget;
-- state-dependent maker skew toward the deficient leg;
-- state-dependent taker repair as imbalance/staleness rise;
-- taker suppression near expiry while maker quoting continues;
-- adaptive 5-40 share clips centered around the observed 10-20 share regime.
+The exact cancelled-quote/queue placement algorithm is not observable from OrderFilled,
+so maker_target remains a calibrated implementation surface rather than a historical claim.
 """
 from __future__ import annotations
 
@@ -70,6 +71,21 @@ class InventoryState:
             return None
         return "UP" if self.up_shares < self.down_shares else "DOWN"
 
+    def side_shares(self, side: str) -> float:
+        if side == "UP":
+            return self.up_shares
+        if side == "DOWN":
+            return self.down_shares
+        raise ValueError("side must be UP or DOWN")
+
+    def deficit_shares(self, side: str) -> float:
+        """Shares required for `side` to return to exact 1:1 inventory."""
+        if side == "UP":
+            return max(0.0, self.down_shares - self.up_shares)
+        if side == "DOWN":
+            return max(0.0, self.up_shares - self.down_shares)
+        raise ValueError("side must be UP or DOWN")
+
     def stale_seconds(self, side: str) -> float:
         """Seconds since this side last filled; market age if it has never filled."""
         ts = self.last_up_fill_ts if side == "UP" else self.last_down_fill_ts
@@ -77,7 +93,7 @@ class InventoryState:
         return max(0.0, self.now_ts - anchor)
 
     def opposite_stale_seconds(self, side: str) -> float:
-        """Decoded feature: lag since the most recent fill on the opposite outcome."""
+        """Nearest-prior opposite-outcome fill lag used by the historical decoder."""
         return self.stale_seconds("DOWN" if side == "UP" else "UP")
 
 
@@ -88,11 +104,11 @@ def tick_floor(price: float, tick: float) -> float:
 
 
 def maker_target(book: BookSide, *, tick: float, inventory_relation: str, ratio: float) -> float | None:
-    """Return a passive bid. Unknown queue policy is represented conservatively.
+    """Return a passive BUY target with inventory skew.
 
-    Balanced: rest at best bid.
-    Deficient leg: improve by one tick when the spread permits it.
-    Heavy leg: shade one tick down once imbalance is material.
+    Full-history terminal inventory is very tight (median larger/smaller ~1.0136), so
+    maker skew begins before taker intervention: deficient inventory improves by a tick
+    from ~3% imbalance when spread permits, while the heavy leg shades down from ~5%.
     """
     if book.best_bid <= 0 or book.best_ask <= book.best_bid or tick <= 0:
         return None
@@ -101,9 +117,9 @@ def maker_target(book: BookSide, *, tick: float, inventory_relation: str, ratio:
         return None
 
     px = tick_floor(book.best_bid, tick)
-    if inventory_relation == "deficient" and ratio >= 1.05 and book.spread >= 2 * tick - 1e-12:
+    if inventory_relation == "deficient" and ratio >= 1.03 and book.spread >= 2 * tick - 1e-12:
         px = min(max_post_only, tick_floor(book.best_bid + tick, tick))
-    elif inventory_relation == "heavy" and ratio >= 1.10:
+    elif inventory_relation == "heavy" and ratio >= 1.05:
         px = max(tick, tick_floor(book.best_bid - tick, tick))
     return min(px, max_post_only)
 
@@ -115,7 +131,6 @@ def projected_combined_vwap(
     price: float,
     shares: float,
 ) -> float | None:
-    """Combined side VWAP after a hypothetical BUY on one side."""
     if shares <= 0:
         return state.combined_vwap
     if side == "UP":
@@ -143,12 +158,7 @@ def basis_allows(
     opposite_reference_price: float | None = None,
     initial_pair_ceiling: float = 1.0,
 ) -> bool:
-    """Economic gate based on aggregate cost basis.
-
-    Once both outcomes exist, guard the projected *portfolio* VWAP. Before both legs
-    exist, use only a loose initial pair ceiling against an observable opposite
-    reference; this avoids recreating the disproven permanent 0.97 pair constraint.
-    """
+    """Guard projected portfolio basis; do not recreate the old fixed $0.97 rule."""
     projected = projected_combined_vwap(state, side=side, price=price, shares=shares)
     if projected is not None:
         return projected <= max_combined_vwap + 1e-12
@@ -181,8 +191,11 @@ def adaptive_clip(
             mult = 1.5
         elif ratio >= 1.05:
             mult = 1.25
-    elif relation == "heavy" and ratio >= 1.10:
-        mult = 0.75
+    elif relation == "heavy":
+        if ratio >= 1.25:
+            mult = 0.50
+        elif ratio >= 1.05:
+            mult = 0.75
     if aggressive:
         mult = max(mult, 1.5)
 
@@ -190,6 +203,46 @@ def adaptive_clip(
     floor_shares = max(min_order_shares, math.ceil(min_notional / price))
     shares = max(floor_shares, math.ceil(raw))
     return float(min(math.ceil(max_clip_shares), shares))
+
+
+def repair_clip(
+    state: InventoryState,
+    *,
+    side: str,
+    proposed_shares: float,
+    min_order_shares: float,
+) -> float:
+    """Cap aggressive repair to the live inventory deficit.
+
+    This prevents the V3 oscillation failure where a 10-share missing leg could trigger
+    a 25-share taker order, immediately flipping which side was deficient. If the deficit
+    is smaller than the exchange minimum, defer to maker skew instead of overshooting.
+    """
+    if state.deficient_side != side:
+        return 0.0
+    deficit = state.deficit_shares(side)
+    if deficit + 1e-9 < min_order_shares:
+        return 0.0
+    return float(max(0.0, min(proposed_shares, deficit)))
+
+
+def _base_taker_stale_threshold(ratio: float) -> float | None:
+    """State threshold calibrated from decoded taker-share monotonicity.
+
+    Historical taker share rose with imbalance and peaked around 30-60s of opposite-leg
+    staleness. We use those measured relationships as a repair gate, not a random timer.
+    """
+    if math.isinf(ratio) or ratio >= 2.0:
+        return 30.0
+    if ratio >= 1.50:
+        return 30.0
+    if ratio >= 1.25:
+        return 40.0
+    if ratio >= 1.10:
+        return 50.0
+    if ratio >= 1.05:
+        return 60.0
+    return None
 
 
 def taker_should_fire(
@@ -201,51 +254,43 @@ def taker_should_fire(
     max_combined_vwap: float,
     taker_stop_buffer_s: float,
 ) -> bool:
-    """Deterministic taker trigger reflecting the decoded conditional behavior.
+    """Deficient-leg taker repair gate.
 
-    Taker propensity rose with imbalance and opposite-leg staleness but fell sharply
-    near expiration. We encode that monotonic structure rather than pretending the
-    exact hidden probability function is known.
+    The old V3 rule could take while balanced merely because basis looked attractive.
+    Full-history evidence does not support price-edge alone as the taker trigger: taker
+    fills are more associated with underweight/pair-completion states and stale opposite
+    fills, and taker usage declines into the close. This function therefore restricts
+    aggression to deficient-leg repair and progressively raises the evidence requirement
+    as expiry approaches.
     """
+    del target_combined_vwap  # target remains a maker/economic objective, not a taker trigger.
     if state.seconds_to_end <= taker_stop_buffer_s:
         return False
-    ratio = state.larger_to_smaller_ratio
-    deficient = state.deficient_side
-    # The historical decoder measured nearest-prior *opposite-outcome* fill lag.
-    stale = state.opposite_stale_seconds(candidate_side)
-
-    # Exceptionally favorable aggregate economics can justify taking while balanced.
-    if projected_basis is not None and projected_basis <= target_combined_vwap - 0.01:
-        if ratio < 1.05 and state.seconds_to_end > 60:
-            return True
-
-    if deficient != candidate_side:
+    if state.deficient_side != candidate_side:
         return False
     if projected_basis is not None and projected_basis > max_combined_vwap + 1e-12:
         return False
 
-    if math.isinf(ratio):
-        threshold = 5.0
-    elif ratio >= 1.50:
-        threshold = 5.0
-    elif ratio >= 1.25:
-        threshold = 10.0
-    elif ratio >= 1.10:
-        threshold = 15.0
-    elif ratio >= 1.05:
-        threshold = 30.0
-    else:
-        threshold = 45.0
+    ratio = state.larger_to_smaller_ratio
+    threshold = _base_taker_stale_threshold(ratio)
+    if threshold is None:
+        return False
 
-    # Historical taker share declines into the close: demand stronger evidence.
-    if state.seconds_to_end <= 30:
+    remaining = state.seconds_to_end
+    if remaining <= 15:
+        if ratio < 1.50:
+            return False
+        threshold += 20.0
+    elif remaining <= 30:
         if ratio < 1.25:
             return False
-        threshold = max(threshold, 15.0)
-    elif state.seconds_to_end <= 60:
+        threshold += 15.0
+    elif remaining <= 60:
         threshold += 10.0
+    elif remaining <= 120:
+        threshold += 5.0
 
-    return stale >= threshold
+    return state.opposite_stale_seconds(candidate_side) >= threshold
 
 
 def relation_for_side(state: InventoryState, side: str) -> str:
