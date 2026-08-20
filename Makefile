@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: check-python install test dry check merge-proof live cancel positions redeem harvest
+.PHONY: check-python install test dry shadow check merge-proof live cancel positions redeem harvest
 
 check-python:
 	@$(PYTHON) -c 'import sys; req=(3,11); cur=sys.version_info[:2]; assert cur >= req, f"Python >=3.11 required, found {sys.version.split()[0]} at {sys.executable}"'
@@ -13,6 +13,9 @@ test: check-python
 
 dry: check-python
 	$(PYTHON) -m src.main --dry-run
+
+shadow: check-python
+	$(PYTHON) -m tools.shadow_market --asset btc --duration 300
 
 check: check-python
 	$(PYTHON) -m tools.check_setup
