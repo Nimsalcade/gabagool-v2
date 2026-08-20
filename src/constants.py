@@ -31,4 +31,8 @@ UPDOWN_SLUG_TEMPLATES = {
     900: "{asset}-updown-15m-{window_start}",
 }
 
+# Backward-compatible aliases for tooling that still imports the old 15m names.
+WINDOW_SECONDS = 900
+UPDOWN_SLUG_TEMPLATE = UPDOWN_SLUG_TEMPLATES[900]
+
 HEARTBEAT_INTERVAL_S = 5.0
