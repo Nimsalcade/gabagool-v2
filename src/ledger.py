@@ -1,13 +1,4 @@
-"""
-SQLite ledger + reconciliation.
-
-The old bot's internal PnL (+$661) and its wallet (−$186) disagreed by $847
-because nothing forced its books to face the chain. This ledger records every
-order, fill, merge, redeem, and periodic balance snapshot, and `report()`
-prints both views side-by-side so a divergence is visible the hour it starts,
-not after the money is gone.
-"""
-
+"""SQLite order/fill/settlement ledger with reconciliation."""
 from __future__ import annotations
 
 import logging
@@ -40,7 +31,7 @@ CREATE TABLE IF NOT EXISTS balances (
 CREATE TABLE IF NOT EXISTS windows (
     condition_id TEXT PRIMARY KEY, slug TEXT, ts_open REAL, ts_close REAL,
     up_shares REAL, down_shares REAL, up_cost REAL, down_cost REAL,
-    merged_pairs REAL
+    merged_pairs REAL DEFAULT 0
 );
 """
 
@@ -52,66 +43,79 @@ class Ledger:
         self._db.executescript(_SCHEMA)
         self._db.commit()
 
-    # ------------------------------------------------------------- recorders
     def record_order(self, order_id, condition_id, side, price, shares) -> None:
         self._x(
-            "INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?, 'open')"
-            .replace("?,?,?,?,?,?,", "?,?,?,?,?,?,"),  # readability no-op
+            "INSERT OR REPLACE INTO orders(order_id,ts,condition_id,side,price,shares) VALUES (?,?,?,?,?,?)",
             (order_id, time.time(), condition_id, side, price, shares),
-            sql="INSERT OR REPLACE INTO orders(order_id,ts,condition_id,side,price,shares) VALUES (?,?,?,?,?,?)",
         )
 
     def record_fill(self, condition_id, order_id, side, price, shares) -> None:
-        self._x(None, (time.time(), condition_id, order_id, side, price, shares),
-                sql="INSERT INTO fills(ts,condition_id,order_id,side,price,shares) VALUES (?,?,?,?,?,?)")
+        self._x(
+            "INSERT INTO fills(ts,condition_id,order_id,side,price,shares) VALUES (?,?,?,?,?,?)",
+            (time.time(), condition_id, order_id, side, price, shares),
+        )
 
     def record_merge(self, condition_id, pairs, tx_hash) -> None:
-        self._x(None, (time.time(), condition_id, pairs, tx_hash, 1, None),
-                sql="INSERT INTO merges(ts,condition_id,pairs,tx_hash,ok,error) VALUES (?,?,?,?,?,?)")
+        try:
+            self._db.execute(
+                "INSERT INTO merges(ts,condition_id,pairs,tx_hash,ok,error) VALUES (?,?,?,?,?,?)",
+                (time.time(), condition_id, pairs, tx_hash, 1, None),
+            )
+            self._db.execute(
+                "UPDATE windows SET merged_pairs=COALESCE(merged_pairs,0)+? WHERE condition_id=?",
+                (pairs, condition_id),
+            )
+            self._db.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ledger merge write failed: %s", exc)
 
     def record_merge_failure(self, condition_id, error) -> None:
-        self._x(None, (time.time(), condition_id, 0.0, None, 0, str(error)[:500]),
-                sql="INSERT INTO merges(ts,condition_id,pairs,tx_hash,ok,error) VALUES (?,?,?,?,?,?)")
+        self._x(
+            "INSERT INTO merges(ts,condition_id,pairs,tx_hash,ok,error) VALUES (?,?,?,?,?,?)",
+            (time.time(), condition_id, 0.0, None, 0, str(error)[:500]),
+        )
 
     def record_redeem(self, condition_id, tx_hash, ok, error=None) -> None:
-        self._x(None, (time.time(), condition_id, tx_hash, 1 if ok else 0,
-                       None if ok else str(error)[:500]),
-                sql="INSERT INTO redeems(ts,condition_id,tx_hash,ok,error) VALUES (?,?,?,?,?)")
+        self._x(
+            "INSERT INTO redeems(ts,condition_id,tx_hash,ok,error) VALUES (?,?,?,?,?)",
+            (time.time(), condition_id, tx_hash, 1 if ok else 0, None if ok else str(error)[:500]),
+        )
 
     def record_balance(self, pusd: float) -> None:
-        self._x(None, (time.time(), pusd),
-                sql="INSERT INTO balances(ts,pusd) VALUES (?,?)")
+        self._x("INSERT INTO balances(ts,pusd) VALUES (?,?)", (time.time(), pusd))
 
-    def record_window(self, condition_id, slug, ts_open, ts_close,
-                      up_sh, dn_sh, up_cost, dn_cost, merged_pairs) -> None:
-        self._x(None, (condition_id, slug, ts_open, ts_close,
-                       up_sh, dn_sh, up_cost, dn_cost, merged_pairs),
-                sql="INSERT OR REPLACE INTO windows VALUES (?,?,?,?,?,?,?,?,?)")
+    def record_window(
+        self, condition_id, slug, ts_open, ts_close,
+        up_sh, dn_sh, up_cost, dn_cost, merged_pairs,
+    ) -> None:
+        self._x(
+            "INSERT OR REPLACE INTO windows VALUES (?,?,?,?,?,?,?,?,?)",
+            (condition_id, slug, ts_open, ts_close, up_sh, dn_sh, up_cost, dn_cost, merged_pairs),
+        )
 
-    def _x(self, _legacy, params, *, sql) -> None:
+    def _x(self, sql, params) -> None:
         try:
             self._db.execute(sql, params)
             self._db.commit()
-        except Exception as exc:  # noqa: BLE001 — the ledger must never kill trading
+        except Exception as exc:  # noqa: BLE001
             log.warning("ledger write failed: %s", exc)
 
-    # --------------------------------------------------------------- reports
     def report(self) -> str:
         c = self._db.cursor()
         fills_cost = c.execute("SELECT COALESCE(SUM(price*shares),0) FROM fills").fetchone()[0]
         merged = c.execute("SELECT COALESCE(SUM(pairs),0) FROM merges WHERE ok=1").fetchone()[0]
         mfail = c.execute("SELECT COUNT(*) FROM merges WHERE ok=0").fetchone()[0]
+        fill_count = c.execute("SELECT COUNT(*) FROM fills").fetchone()[0]
         first_bal = c.execute("SELECT pusd FROM balances ORDER BY ts ASC LIMIT 1").fetchone()
         last_bal = c.execute("SELECT pusd FROM balances ORDER BY ts DESC LIMIT 1").fetchone()
         b0 = first_bal[0] if first_bal else float("nan")
         b1 = last_bal[0] if last_bal else float("nan")
         return (
             "── RECONCILIATION ───────────────────────────────\n"
-            f" internal: bought=${fills_cost:.2f}  merged=${merged:.2f} "
+            f" internal: fills={fill_count} bought=${fills_cost:.2f} merged=${merged:.2f} "
             f"(failed merges: {mfail})\n"
             f" wallet:   pUSD {b0:.2f} → {b1:.2f}  (Δ {b1 - b0:+.2f})\n"
-            " note: wallet Δ also reflects open inventory and pending redeems;\n"
-            " a growing unexplained gap means STOP and investigate.\n"
+            " note: wallet Δ also reflects open inventory, residual resolution, and fees.\n"
             "─────────────────────────────────────────────────"
         )
 
