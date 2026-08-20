@@ -1,22 +1,13 @@
-"""
-Window manager: discovers upcoming 15-minute windows, runs one MakerLoop per
-window under the concurrency cap, and hands finished conditions to the
-redeem sweeper so the ≤6% naked residue (and any unmerged dust) comes home.
-
-The redeem path matters more than it looks: the old wallet's history shows
-redemption dust trickling in for *days* because nothing claimed it. Here,
-every condition the bot touched is checked after resolution and redeemed
-gaslessly the moment the Data API flags it redeemable.
-"""
-
+"""Market scheduling and post-close settlement orchestration."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from .capital import KillSwitch
-from .discovery import discover
+from .discovery import UpDownMarket, discover
 from .inventory import fetch_holding
 from .maker_loop import MakerLoop
 from .merge_engine import MergeEngine
@@ -24,72 +15,139 @@ from .merge_engine import MergeEngine
 log = logging.getLogger("window_manager")
 
 
-class Redeemer:
-    def __init__(self, client, *, dry_run: bool, ledger=None):
-        self.client = client
-        self.dry_run = dry_run
-        self.ledger = ledger
-        self._pending: dict[str, str] = {}   # condition_id -> market_id
+@dataclass
+class _PendingSettlement:
+    market: UpDownMarket
+    first_seen: float
 
-    def enqueue(self, condition_id: str, market_id: str) -> None:
-        self._pending[condition_id] = market_id
+
+class SettlementManager:
+    """Batch-sweep pending conditions after close.
+
+    The SDK currently exposes merge per condition, so each condition is a separate
+    relayer call; the scheduler still follows the observed timing pattern by holding
+    matched inventory through the live window and sweeping multiple closed markets
+    together rather than merging every few seconds while trading.
+    """
+
+    def __init__(self, client, *, cfg, capital, ledger=None, dry_run=True):
+        self.client = client
+        self.cfg = cfg
+        self.capital = capital
+        self.ledger = ledger
+        self.dry_run = dry_run
+        self.merges = MergeEngine(
+            client,
+            dry_run=dry_run,
+            min_pairs=cfg.min_pairs_to_merge,
+            ledger=ledger,
+        )
+        self._pending: dict[str, _PendingSettlement] = {}
+        self._last_sweep = 0.0
+
+    def enqueue(self, market: UpDownMarket) -> None:
+        self._pending[market.condition_id] = _PendingSettlement(market, time.time())
+
+    def contains(self, condition_id: str) -> bool:
+        return condition_id in self._pending
 
     async def sweep(self) -> None:
-        for condition_id, market_id in list(self._pending.items()):
-            holding = await fetch_holding(self.client, condition_id)
-            if holding.up_shares <= 0 and holding.down_shares <= 0:
-                self._pending.pop(condition_id, None)        # nothing left
-                continue
-            if not holding.redeemable:
-                continue                                     # not resolved yet
+        now = time.time()
+        if now - self._last_sweep < self.cfg.settlement_sweep_interval_s:
+            return
+        self._last_sweep = now
+        due = [
+            p for p in self._pending.values()
+            if now >= p.market.window_end + self.cfg.merge_after_close_s
+        ]
+        if not due:
+            return
+        log.info("settlement sweep: %d closed conditions", len(due))
+
+        for p in due:
+            cid = p.market.condition_id
             if self.dry_run:
-                log.info("[dry] would redeem %s", condition_id[:12])
-                self._pending.pop(condition_id, None)
+                self.capital.close_condition(cid)
+                self._pending.pop(cid, None)
                 continue
-            try:
-                handle = await self.client.redeem_positions(condition_id=condition_id)
-                outcome = await handle.wait()
-                tx = str(getattr(outcome, "transaction_hash", "") or "") or None
-                log.info("REDEEMED %s | tx=%s", condition_id[:12], tx)
-                if self.ledger is not None:
-                    self.ledger.record_redeem(condition_id, tx, True)
-                self._pending.pop(condition_id, None)
-            except Exception as exc:  # noqa: BLE001 — retried next sweep
-                log.warning("redeem failed for %s: %s", condition_id[:12], exc)
-                if self.ledger is not None:
-                    self.ledger.record_redeem(condition_id, None, False, exc)
+
+            holding = await fetch_holding(self.client, cid)
+            if holding.up_shares <= 0 and holding.down_shares <= 0:
+                self.capital.close_condition(cid)
+                self._pending.pop(cid, None)
+                continue
+
+            if holding.pairs > 0:
+                res = await self.merges.merge_condition(cid, force=True)
+                if res.success:
+                    self.capital.on_settlement_return(cid, res.pairs)
+                    holding = await fetch_holding(self.client, cid)
+
+            if holding.up_shares <= 0 and holding.down_shares <= 0:
+                self.capital.close_condition(cid)
+                self._pending.pop(cid, None)
+                continue
+
+            if holding.redeemable:
+                try:
+                    handle = await self.client.redeem_positions(condition_id=cid)
+                    outcome = await handle.wait()
+                    tx = str(getattr(outcome, "transaction_hash", "") or "") or None
+                    if self.ledger is not None:
+                        self.ledger.record_redeem(cid, tx, True)
+                    log.info("REDEEMED %s tx=%s", cid[:12], tx)
+                    self.capital.close_condition(cid)
+                    self._pending.pop(cid, None)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("redeem failed for %s: %s", cid[:12], exc)
+                    if self.ledger is not None:
+                        self.ledger.record_redeem(cid, None, False, exc)
+                continue
+
+            if now > p.market.window_end + 3600 and holding.pairs <= 1e-9:
+                log.warning(
+                    "settlement stale >1h for %s; no matched pairs/redeem flag — "
+                    "closing exposure accounting, leaving position for manual sweep",
+                    cid[:12],
+                )
+                self.capital.close_condition(cid)
+                self._pending.pop(cid, None)
 
 
 class WindowManager:
     def __init__(self, client, *, cfg, capital, ledger=None):
         self.client = client
-        self.cfg = cfg                      # BotConfig
+        self.cfg = cfg
         self.capital = capital
         self.ledger = ledger
-        self.merges = MergeEngine(
+        self.settlement = SettlementManager(
             client,
-            dry_run=cfg.dry_run,
-            min_pairs=cfg.strategy.min_pairs_to_merge,
+            cfg=cfg.strategy,
+            capital=capital,
             ledger=ledger,
+            dry_run=cfg.dry_run,
         )
-        self.redeemer = Redeemer(client, dry_run=cfg.dry_run, ledger=ledger)
-        self._active: dict[str, asyncio.Task] = {}   # condition_id -> task
+        self._active: dict[str, asyncio.Task] = {}
 
     async def run_forever(self) -> None:
         scfg = self.cfg.strategy
         log.info(
-            "window manager up | assets=%s | budget=%.2f | per-window cap=$%.0f | %s",
-            ",".join(scfg.assets), scfg.combined_budget,
-            self.cfg.capital.per_window_cap_usd,
+            "window manager | assets=%s durations=%s target_basis=%.3f max_basis=%.3f | %s",
+            ",".join(scfg.assets),
+            ",".join(str(d) for d in scfg.durations),
+            scfg.target_combined_vwap,
+            scfg.max_combined_vwap,
             "DRY-RUN" if self.cfg.dry_run else "LIVE",
         )
         try:
             while True:
                 await self._reap_finished()
                 await self._launch_new()
-                await self.redeemer.sweep()
-                await self.capital.check_kill_switch(self.client, dry_run=self.cfg.dry_run)
-                await asyncio.sleep(5.0)
+                await self.settlement.sweep()
+                await self.capital.check_kill_switch(
+                    self.client, dry_run=self.cfg.dry_run
+                )
+                await asyncio.sleep(2.0)
         except KillSwitch as ks:
             log.critical("KILL SWITCH: %s", ks)
             await self.shutdown()
@@ -98,34 +156,31 @@ class WindowManager:
             await self.shutdown()
             raise
 
-    # ---------------------------------------------------------------- detail
     async def _launch_new(self) -> None:
         if len(self._active) >= self.cfg.capital.max_concurrent_windows:
             return
         try:
-            markets = await discover(self.client, self.cfg.strategy.assets)
+            markets = await discover(
+                self.client,
+                self.cfg.strategy.assets,
+                self.cfg.strategy.durations,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("discovery failed: %s", exc)
             return
+
         for m in markets:
-            if m.condition_id in self._active:
+            if m.condition_id in self._active or self.settlement.contains(m.condition_id):
                 continue
             if len(self._active) >= self.cfg.capital.max_concurrent_windows:
                 break
-            # Only start a window worth working: needs more remaining life
-            # than the posting buffer, else we'd HOLD immediately.
-            if m.seconds_to_end <= self.cfg.strategy.stop_posting_buffer_s + 30:
-                continue
-            if m.neg_risk:
-                # Up/Down 15m markets are standard; a neg-risk one here means
-                # the series changed shape — refuse rather than mis-route.
-                log.warning("skipping %s: unexpected neg_risk market", m.slug)
+            if m.seconds_to_end <= self.cfg.strategy.stop_posting_buffer_s + 3:
                 continue
             loop = MakerLoop(
-                self.client, m,
+                self.client,
+                m,
                 cfg=self.cfg.strategy,
                 capital=self.capital,
-                merge_engine=self.merges,
                 ledger=self.ledger,
                 dry_run=self.cfg.dry_run,
             )
@@ -140,12 +195,11 @@ class WindowManager:
             self._active.pop(condition_id, None)
             try:
                 result = task.result()
-                self.redeemer.enqueue(condition_id, result.market.market_id)
+                self.settlement.enqueue(result.market)
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:  # noqa: BLE001 — one window must not kill the rest
+            except Exception as exc:  # noqa: BLE001
                 log.error("window task crashed: %s", exc, exc_info=True)
-                self.redeemer.enqueue(condition_id, "")
 
     async def shutdown(self) -> None:
         log.info("shutdown: cancelling %d active windows", len(self._active))
@@ -157,9 +211,7 @@ class WindowManager:
         if not self.cfg.dry_run:
             try:
                 await self.client.cancel_all()
-                log.info("cancel_all confirmed — no resting orders remain")
+                log.info("cancel_all confirmed")
             except Exception as exc:  # noqa: BLE001
-                log.error("cancel_all failed: %s — check the UI for orphans", exc)
-        log.info(self.merges.session_summary())
-        if time.time():  # keep linters honest about the import
-            pass
+                log.error("cancel_all failed: %s", exc)
+        log.info(self.settlement.merges.session_summary())
