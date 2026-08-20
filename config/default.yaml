@@ -1,33 +1,51 @@
-# Gabagool v2 — default configuration
-# Credentials come from environment variables (.env), never from this file.
-#   POLY_PRIVATE_KEY, POLY_WALLET, POLY_RELAYER_API_KEY, POLY_RELAYER_API_KEY_ADDRESS
+# Gabagool v3 — forensic-calibrated policy defaults
+# Credentials remain environment-only.
 
-dry_run: true          # main.py --live overrides; keep true here as a safety default
-heartbeat: true        # V2 dead-man's switch: orders auto-cancel if the bot dies
-db_path: data/gabagool_v2.sqlite
+dry_run: true
+heartbeat: true
+db_path: data/gabagool_v3.sqlite
 log_level: INFO
 
 clob:
-  signature_type: 3     # 3=POLY_1271 (Deposit Wallet); 1=Proxy; 2=Safe; 0=EOA
+  signature_type: 3
 
 strategy:
-  combined_budget: 0.97        # max sum of our two bids; 1.00 − this = gross margin/pair
-  requote_drift: 0.02
-  requote_interval_s: 3.0
-  stop_posting_buffer_s: 75    # cancel + final merge this long before window end
-  imbalance_pause_at: 0.15     # pause heavy side beyond 15% share imbalance…
-  imbalance_resume_at: 0.06    # …resume under 6% (hysteresis)
-  imbalance_min_gap_shares: 10
-  rung_dollar_target: 4.0
-  max_shares_per_side: 500
-  min_pairs_to_merge: 5        # merge as soon as ≥5 matched pairs exist on-chain
-  merge_interval_s: 20
-  assets: [btc, eth]
+  # Aggregate portfolio economics. These are cost-basis controls, not a fixed pair cap.
+  target_combined_vwap: 0.985
+  max_combined_vwap: 1.01
+  initial_pair_ceiling: 1.00
+
+  # Quote cadence. Exact cancelled-quote behavior is not observable from fills.
+  requote_drift: 0.01
+  requote_interval_s: 1.0
+  stop_posting_buffer_s: 2
+  entry_delay_by_duration_s:
+    300: 10
+    900: 12
+
+  # Clip schedule calibrated to the observed 5-50 share regime.
+  base_clip_shares: 10
+  max_clip_shares: 40
+  max_shares_per_side: 2500
+  hard_pause_ratio: 2.0
+
+  # Mixed execution. Taker logic is state-dependent and fades near expiry.
+  taker_enabled: true
+  taker_stop_buffer_s: 15
+
+  # Real account behavior mostly settled after close instead of merging every few seconds.
+  merge_after_close_s: 5
+  settlement_sweep_interval_s: 10
+  min_pairs_to_merge: 1
+
+  assets: [btc, eth, sol, xrp]
+  durations: [300, 900]
 
 capital:
-  per_window_cap_usd: 50
-  global_exposure_cap_usd: 150
-  max_concurrent_windows: 2
-  session_drawdown_kill: 0.10  # halt + cancel-all if cash equity drops 10%
-  min_starting_pusd: 17
-  harvest_floor_usd: 30         # leave this much pUSD in wallet; withdraw the rest
+  # Safety limits only; not claims about Gabagool's capital size.
+  per_window_cap_usd: 250
+  global_exposure_cap_usd: 1000
+  max_concurrent_windows: 4
+  session_drawdown_kill: 0.10
+  min_starting_pusd: 20
+  harvest_floor_usd: 30
