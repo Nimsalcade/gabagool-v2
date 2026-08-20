@@ -82,16 +82,26 @@ class SettlementManager:
                 continue
 
             if holding.pairs > 0:
+                before_pairs = holding.pairs
                 res = await self.merges.merge_condition(cid, force=True)
                 if res.success:
-                    self.capital.on_settlement_return(cid, res.pairs)
-                    holding = await fetch_holding(self.client, cid)
-                    if not holding.valid:
+                    post = await fetch_holding(self.client, cid)
+                    if not post.valid:
                         log.warning(
-                            "post-merge holdings read unavailable for %s; keeping pending",
+                            "merge submitted for %s but post-merge holdings are unavailable; "
+                            "keeping pending and NOT crediting capital",
                             cid[:12],
                         )
                         continue
+                    returned = max(0.0, before_pairs - post.pairs)
+                    if returned <= 1e-9:
+                        log.warning(
+                            "merge for %s is not yet reflected in holdings; keeping pending and NOT crediting capital",
+                            cid[:12],
+                        )
+                        continue
+                    self.capital.on_settlement_return(cid, returned)
+                    holding = post
 
             if holding.up_shares <= 0 and holding.down_shares <= 0:
                 self.capital.close_condition(cid)
@@ -105,8 +115,8 @@ class SettlementManager:
                     tx = str(getattr(outcome, "transaction_hash", "") or "") or None
                     if self.ledger is not None:
                         self.ledger.record_redeem(cid, tx, True)
-                    # Do not assume the tx response alone cleared inventory. A later
-                    # sweep will verify zero holdings before dropping the condition.
+                    # Transaction acceptance is not the same as zero inventory. A
+                    # later sweep must prove holdings are gone before exposure closes.
                     log.info("REDEEM submitted %s tx=%s; awaiting zero-holding proof", cid[:12], tx)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("redeem failed for %s: %s", cid[:12], exc)
@@ -140,13 +150,14 @@ class WindowManager:
 
     async def run_forever(self) -> None:
         scfg = self.cfg.strategy
+        mode = "DRY-RUN/SYNTHETIC-FILLS (PLUMBING ONLY)" if self.cfg.dry_run else "LIVE"
         log.info(
             "window manager | assets=%s durations=%s target_basis=%.3f max_basis=%.3f | %s",
             ",".join(scfg.assets),
             ",".join(str(d) for d in scfg.durations),
             scfg.target_combined_vwap,
             scfg.max_combined_vwap,
-            "DRY-RUN" if self.cfg.dry_run else "LIVE",
+            mode,
         )
         try:
             while True:
