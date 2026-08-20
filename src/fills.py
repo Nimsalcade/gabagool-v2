@@ -3,9 +3,9 @@
 Rules:
 - an order disappearing from open orders is never inferred as a fill;
 - maker fills use exchange `size_matched` while open, then confirmed trade attribution;
-- FAK taker orders are re-checked against the trades API for a short finalization window
-  because they disappear immediately and trade indexing can lag the order response;
-- taker cost uses actual trade price, not the planning max-price.
+- FAK taker orders are re-checked against the trades API for a short finalization window;
+- taker cost uses actual trade price, not the planning max-price;
+- maker/taker execution-event counts increment only when authoritative filled quantity grows.
 """
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ class TrackedOrder:
     order_id: str
     side: str
     token_id: str
-    price: float                 # maker limit or taker max-price planning value
-    shares: float                # maker size or taker planning share estimate
-    mode: str = "maker"          # maker | taker
+    price: float
+    shares: float
+    mode: str = "maker"
     filled: float = 0.0
     filled_cost: float = 0.0
     open: bool = True
@@ -58,6 +58,16 @@ class FillTracker:
     orders: dict[str, TrackedOrder] = field(default_factory=dict)
     up: SideTotals = field(default_factory=SideTotals)
     down: SideTotals = field(default_factory=SideTotals)
+    maker_fill_events: int = 0
+    taker_fill_events: int = 0
+
+    @property
+    def fill_events(self) -> int:
+        return self.maker_fill_events + self.taker_fill_events
+
+    @property
+    def taker_share(self) -> float:
+        return self.taker_fill_events / self.fill_events if self.fill_events else 0.0
 
     def register(
         self,
@@ -119,10 +129,8 @@ class FillTracker:
             if o.mode == "taker":
                 agg = traded.get(o.order_id)
                 if agg is not None:
-                    target_shares = agg.shares
-                    target_cost = agg.cost
-                    new_notional += self._apply_target(o, target_shares, target_cost)
-                o.open = False  # FAK never rests after the request completes.
+                    new_notional += self._apply_target(o, agg.shares, agg.cost)
+                o.open = False
                 if now - o.created_ts > _TAKER_FINALIZE_S:
                     o.finalized = True
                 continue
@@ -150,8 +158,6 @@ class FillTracker:
         if delta_shares <= 1e-9 and delta_cost <= 1e-9:
             return 0.0
         if delta_shares < -1e-9 or delta_cost < -1e-7:
-            # Confirmed trade aggregates should be monotonic. Never rewrite inventory
-            # backwards on an inconsistent transient API response.
             log.warning("non-monotonic fill aggregate for %s; ignoring", o.order_id[:10])
             return 0.0
         if delta_shares <= 1e-9:
@@ -165,14 +171,19 @@ class FillTracker:
         tot.cost += delta_cost if delta_cost > 0 else delta_shares * o.price
         tot.max_price = max(tot.max_price, fill_price)
         tot.last_fill_ts = time.time()
+        if o.mode == "taker":
+            self.taker_fill_events += 1
+        else:
+            self.maker_fill_events += 1
         notional = delta_cost if delta_cost > 0 else delta_shares * o.price
         if self.ledger is not None:
             self.ledger.record_fill(
                 self.condition_id, o.order_id, o.side, fill_price, delta_shares
             )
         log.info(
-            "FILL %s %s %.3f sh @ %.4f [%s] order=%s",
+            "FILL %s %s %.3f sh @ %.4f [%s] order=%s | role=%dM/%dT",
             self.condition_id[:10], o.side, delta_shares, fill_price, o.mode, o.order_id[:10],
+            self.maker_fill_events, self.taker_fill_events,
         )
         return notional
 
@@ -197,7 +208,6 @@ class FillTracker:
                         if moid in self.orders:
                             amt = float(getattr(mo, "matched_amount", 0) or 0)
                             shares[moid] = shares.get(moid, 0.0) + amt
-                            # Maker limit price is authoritative for its leg.
                             costs[moid] = costs.get(moid, 0.0) + amt * self.orders[moid].price
         except Exception as exc:  # noqa: BLE001
             log.debug("trades poll failed (%s); no new information", exc)
