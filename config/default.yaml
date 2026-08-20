@@ -10,7 +10,8 @@ clob:
   signature_type: 3
 
 strategy:
-  # Aggregate portfolio economics. These are cost-basis controls, not a fixed pair cap.
+  # Aggregate portfolio economics. max_combined_vwap is a safety ceiling,
+  # not a claim that the reference trader used a hard threshold there.
   target_combined_vwap: 0.985
   max_combined_vwap: 1.01
   initial_pair_ceiling: 1.00
@@ -27,13 +28,13 @@ strategy:
   base_clip_shares: 10
   max_clip_shares: 40
   max_shares_per_side: 2500
-  hard_pause_ratio: 2.0
+  hard_pause_ratio: 5.0
 
-  # Mixed execution. Taker logic is state-dependent and fades near expiry.
+  # Taker fills historically persist into the last seconds at reduced frequency.
   taker_enabled: true
-  taker_stop_buffer_s: 15
+  taker_stop_buffer_s: 2
 
-  # Real account behavior mostly settled after close instead of merging every few seconds.
+  # Reference settlement was predominantly after close.
   merge_after_close_s: 5
   settlement_sweep_interval_s: 10
   min_pairs_to_merge: 1
@@ -42,7 +43,7 @@ strategy:
   durations: [300, 900]
 
 capital:
-  # Safety limits only; not claims about Gabagool's capital size.
+  # Deployment safety limits only; not reference-account sizing claims.
   per_window_cap_usd: 250
   global_exposure_cap_usd: 1000
   max_concurrent_windows: 4
