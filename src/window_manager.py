@@ -19,15 +19,16 @@ log = logging.getLogger("window_manager")
 class _PendingSettlement:
     market: UpDownMarket
     first_seen: float
+    last_stale_warning: float = 0.0
 
 
 class SettlementManager:
-    """Batch-sweep pending conditions after close.
+    """Sweep closed conditions without ever abandoning unresolved inventory.
 
-    The SDK currently exposes merge per condition, so each condition is a separate
-    relayer call; the scheduler still follows the observed timing pattern by holding
-    matched inventory through the live window and sweeping multiple closed markets
-    together rather than merging every few seconds while trading.
+    The SDK merge action is per condition, so the implementation cannot reproduce the
+    reference wallet's single multi-market transaction shape. It does reproduce the
+    evidence-backed timing policy: no live-window merge loop; multiple closed conditions
+    become due together and are swept after close.
     """
 
     def __init__(self, client, *, cfg, capital, ledger=None, dry_run=True):
@@ -72,6 +73,9 @@ class SettlementManager:
                 continue
 
             holding = await fetch_holding(self.client, cid)
+            if not holding.valid:
+                log.warning("settlement read unavailable for %s; keeping pending", cid[:12])
+                continue
             if holding.up_shares <= 0 and holding.down_shares <= 0:
                 self.capital.close_condition(cid)
                 self._pending.pop(cid, None)
@@ -82,6 +86,12 @@ class SettlementManager:
                 if res.success:
                     self.capital.on_settlement_return(cid, res.pairs)
                     holding = await fetch_holding(self.client, cid)
+                    if not holding.valid:
+                        log.warning(
+                            "post-merge holdings read unavailable for %s; keeping pending",
+                            cid[:12],
+                        )
+                        continue
 
             if holding.up_shares <= 0 and holding.down_shares <= 0:
                 self.capital.close_condition(cid)
@@ -95,23 +105,22 @@ class SettlementManager:
                     tx = str(getattr(outcome, "transaction_hash", "") or "") or None
                     if self.ledger is not None:
                         self.ledger.record_redeem(cid, tx, True)
-                    log.info("REDEEMED %s tx=%s", cid[:12], tx)
-                    self.capital.close_condition(cid)
-                    self._pending.pop(cid, None)
+                    # Do not assume the tx response alone cleared inventory. A later
+                    # sweep will verify zero holdings before dropping the condition.
+                    log.info("REDEEM submitted %s tx=%s; awaiting zero-holding proof", cid[:12], tx)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("redeem failed for %s: %s", cid[:12], exc)
                     if self.ledger is not None:
                         self.ledger.record_redeem(cid, None, False, exc)
                 continue
 
-            if now > p.market.window_end + 3600 and holding.pairs <= 1e-9:
+            # Never drop unresolved exposure just because indexing/resolution is slow.
+            if now > p.market.window_end + 3600 and now - p.last_stale_warning > 900:
+                p.last_stale_warning = now
                 log.warning(
-                    "settlement stale >1h for %s; no matched pairs/redeem flag — "
-                    "closing exposure accounting, leaving position for manual sweep",
-                    cid[:12],
+                    "settlement still pending >1h for %s: UP %.6f DOWN %.6f; retaining until proven clear",
+                    cid[:12], holding.up_shares, holding.down_shares,
                 )
-                self.capital.close_condition(cid)
-                self._pending.pop(cid, None)
 
 
 class WindowManager:
