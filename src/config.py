@@ -18,8 +18,8 @@ class ConfigError(RuntimeError):
 
 @dataclass
 class StrategyConfig:
-    # Forensic-calibrated aggregate economics. Median historical terminal
-    # combined side VWAP was ~0.985; p95 was ~1.011.
+    # Economic controls. `target` is a calibration objective; `max` is an
+    # implementation safety ceiling, not a claimed historical hard threshold.
     target_combined_vwap: float = 0.985
     max_combined_vwap: float = 1.01
     initial_pair_ceiling: float = 1.00
@@ -36,22 +36,25 @@ class StrategyConfig:
     base_clip_shares: float = 10.0
     max_clip_shares: float = 40.0
     max_shares_per_side: float = 2500.0
-    hard_pause_ratio: float = 2.0
 
-    # Mixed execution: historical aggregate was ~85.45% maker / 14.55% taker.
+    # Emergency-only heavy-side brake. The forensic history does NOT establish a
+    # normal hard pause threshold; keep this far outside ordinary imbalance states.
+    hard_pause_ratio: float = 5.0
+
+    # Mixed execution. Historical taker fills continue into the final seconds, but
+    # at much lower frequency, so only the final maker shutdown buffer is a hard stop.
     taker_enabled: bool = True
-    taker_stop_buffer_s: float = 15.0
+    taker_stop_buffer_s: float = 2.0
 
     # Settlement is post-close, not every few seconds while trading.
     merge_after_close_s: float = 5.0
     settlement_sweep_interval_s: float = 10.0
     min_pairs_to_merge: float = 1.0
 
-    # Current candidate universe. Discovery safely ignores series that do not exist.
     assets: tuple[str, ...] = ("btc", "eth", "sol", "xrp")
     durations: tuple[int, ...] = (300, 900)
 
-    # Backward-compatible input only. It is deliberately ignored by the new policy.
+    # Backward-compatible input only. Deliberately ignored by V3 policy.
     combined_budget: float | None = None
 
     def validate(self) -> None:
@@ -69,8 +72,8 @@ class StrategyConfig:
             raise ConfigError("invalid clip size bounds")
         if self.max_shares_per_side < self.max_clip_shares:
             raise ConfigError("max_shares_per_side below max_clip_shares")
-        if self.hard_pause_ratio < 1.25:
-            raise ConfigError("hard_pause_ratio must be >= 1.25")
+        if self.hard_pause_ratio < 2.0:
+            raise ConfigError("hard_pause_ratio must be >= 2.0")
         if self.taker_stop_buffer_s < self.stop_posting_buffer_s:
             raise ConfigError("taker_stop_buffer_s must be >= stop_posting_buffer_s")
         if self.min_pairs_to_merge < 0:
