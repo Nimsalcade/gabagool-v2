@@ -6,7 +6,7 @@ This module encodes only behavior supported by the completed execution reconstru
 - aggregate cost-basis control instead of a fixed per-quote pair cap;
 - tighter maker skew as inventory departs from 1:1;
 - taker use concentrated on deficient-leg repair, not generic edge chasing;
-- aggressive clip size capped by the actual inventory deficit to avoid oscillation;
+- aggressive sizing constrained so small deficits do not flip the imbalance;
 - taker urgency rises with imbalance/staleness and falls into expiry;
 - 5-40 share clips centered on the observed 10-20 share regime.
 
@@ -79,7 +79,6 @@ class InventoryState:
         raise ValueError("side must be UP or DOWN")
 
     def deficit_shares(self, side: str) -> float:
-        """Shares required for `side` to return to exact 1:1 inventory."""
         if side == "UP":
             return max(0.0, self.down_shares - self.up_shares)
         if side == "DOWN":
@@ -87,13 +86,11 @@ class InventoryState:
         raise ValueError("side must be UP or DOWN")
 
     def stale_seconds(self, side: str) -> float:
-        """Seconds since this side last filled; market age if it has never filled."""
         ts = self.last_up_fill_ts if side == "UP" else self.last_down_fill_ts
         anchor = ts if ts is not None else self.window_start_ts
         return max(0.0, self.now_ts - anchor)
 
     def opposite_stale_seconds(self, side: str) -> float:
-        """Nearest-prior opposite-outcome fill lag used by the historical decoder."""
         return self.stale_seconds("DOWN" if side == "UP" else "UP")
 
 
@@ -104,18 +101,17 @@ def tick_floor(price: float, tick: float) -> float:
 
 
 def maker_target(book: BookSide, *, tick: float, inventory_relation: str, ratio: float) -> float | None:
-    """Return a passive BUY target with inventory skew.
+    """Passive BUY target with early inventory skew.
 
-    Full-history terminal inventory is very tight (median larger/smaller ~1.0136), so
-    maker skew begins before taker intervention: deficient inventory improves by a tick
-    from ~3% imbalance when spread permits, while the heavy leg shades down from ~5%.
+    Terminal inventory is extremely tight historically, so the maker layer begins
+    correcting before the taker layer: deficient inventory improves from ~3% imbalance
+    when spread permits, while the heavy leg shades down from ~5%.
     """
     if book.best_bid <= 0 or book.best_ask <= book.best_bid or tick <= 0:
         return None
     max_post_only = tick_floor(book.best_ask - tick, tick)
     if max_post_only < tick:
         return None
-
     px = tick_floor(book.best_bid, tick)
     if inventory_relation == "deficient" and ratio >= 1.03 and book.spread >= 2 * tick - 1e-12:
         px = min(max_post_only, tick_floor(book.best_bid + tick, tick))
@@ -158,7 +154,6 @@ def basis_allows(
     opposite_reference_price: float | None = None,
     initial_pair_ceiling: float = 1.0,
 ) -> bool:
-    """Guard projected portfolio basis; do not recreate the old fixed $0.97 rule."""
     projected = projected_combined_vwap(state, side=side, price=price, shares=shares)
     if projected is not None:
         return projected <= max_combined_vwap + 1e-12
@@ -178,7 +173,7 @@ def adaptive_clip(
     relation: str,
     aggressive: bool,
 ) -> float:
-    """Adaptive whole-share clip calibrated to the observed 5-50 share regime."""
+    """Whole-share clip schedule centered on the observed 10-20 share regime."""
     if price <= 0:
         raise ValueError("price must be positive")
     mult = 1.0
@@ -196,8 +191,12 @@ def adaptive_clip(
             mult = 0.50
         elif ratio >= 1.05:
             mult = 0.75
+
+    # Aggressive fills were larger on average, but V3 over-amplified missing-leg
+    # states. Keep the normal taker clip in the empirically dominant <=20-share band;
+    # 20-50 share fills remain available through configured max clip in future tuning.
     if aggressive:
-        mult = max(mult, 1.5)
+        mult = min(2.0, max(1.0, mult))
 
     raw = base_clip_shares * mult
     floor_shares = max(min_order_shares, math.ceil(min_notional / price))
@@ -212,12 +211,7 @@ def repair_clip(
     proposed_shares: float,
     min_order_shares: float,
 ) -> float:
-    """Cap aggressive repair to the live inventory deficit.
-
-    This prevents the V3 oscillation failure where a 10-share missing leg could trigger
-    a 25-share taker order, immediately flipping which side was deficient. If the deficit
-    is smaller than the exchange minimum, defer to maker skew instead of overshooting.
-    """
+    """Exact-deficit cap for callers that can apply it before sending a FAK."""
     if state.deficient_side != side:
         return 0.0
     deficit = state.deficit_shares(side)
@@ -227,11 +221,6 @@ def repair_clip(
 
 
 def _base_taker_stale_threshold(ratio: float) -> float | None:
-    """State threshold calibrated from decoded taker-share monotonicity.
-
-    Historical taker share rose with imbalance and peaked around 30-60s of opposite-leg
-    staleness. We use those measured relationships as a repair gate, not a random timer.
-    """
     if math.isinf(ratio) or ratio >= 2.0:
         return 30.0
     if ratio >= 1.50:
@@ -245,6 +234,15 @@ def _base_taker_stale_threshold(ratio: float) -> float | None:
     return None
 
 
+def _minimum_repair_deficit(ratio: float) -> float:
+    """Avoid firing a clip larger than a very small live deficit."""
+    if math.isinf(ratio) or ratio >= 1.25:
+        return 20.0
+    if ratio >= 1.10:
+        return 15.0
+    return 10.0
+
+
 def taker_should_fire(
     state: InventoryState,
     *,
@@ -254,16 +252,13 @@ def taker_should_fire(
     max_combined_vwap: float,
     taker_stop_buffer_s: float,
 ) -> bool:
-    """Deficient-leg taker repair gate.
+    """Deficient-leg taker repair gate derived from the full-history cross-tabs.
 
-    The old V3 rule could take while balanced merely because basis looked attractive.
-    Full-history evidence does not support price-edge alone as the taker trigger: taker
-    fills are more associated with underweight/pair-completion states and stale opposite
-    fills, and taker usage declines into the close. This function therefore restricts
-    aggression to deficient-leg repair and progressively raises the evidence requirement
-    as expiry approaches.
+    Price edge alone is not a trigger. Taker use increases with imbalance and stale
+    opposite fills, but decreases into the close. Small deficits are left to maker skew
+    instead of being over-repaired by a FAK.
     """
-    del target_combined_vwap  # target remains a maker/economic objective, not a taker trigger.
+    del target_combined_vwap
     if state.seconds_to_end <= taker_stop_buffer_s:
         return False
     if state.deficient_side != candidate_side:
@@ -274,6 +269,8 @@ def taker_should_fire(
     ratio = state.larger_to_smaller_ratio
     threshold = _base_taker_stale_threshold(ratio)
     if threshold is None:
+        return False
+    if state.deficit_shares(candidate_side) + 1e-9 < _minimum_repair_deficit(ratio):
         return False
 
     remaining = state.seconds_to_end
