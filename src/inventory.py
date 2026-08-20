@@ -1,13 +1,8 @@
-"""
-On-chain inventory truth.
+"""On-chain/account inventory truth.
 
-RULE: merge amounts are computed from what the wallet ACTUALLY HOLDS
-(Data-API positions, which index the chain), never from the bot's internal
-fill ledger. The internal ledger drives quoting decisions; the chain drives
-money movements. Keeping these two roles separate is what makes a merge
-mathematically unable to 'not match'.
+A positions API transport failure is represented explicitly as `valid=False`; callers must
+never interpret a failed read as a real zero balance and drop settlement work.
 """
-
 from __future__ import annotations
 
 import logging
@@ -26,21 +21,27 @@ class ConditionHolding:
     up_token_id: str | None
     down_token_id: str | None
     redeemable: bool
-    mergeable_flag: bool      # Data-API's own mergeable signal (belt)
+    mergeable_flag: bool
     neg_risk: bool
+    valid: bool = True
 
     @property
-    def pairs(self) -> float:  # …and suspenders: our own min() (must agree)
+    def pairs(self) -> float:
         return min(self.up_shares, self.down_shares)
 
 
 async def fetch_holding(client, condition_id: str) -> ConditionHolding:
-    """Aggregate both outcome legs of one condition from list_positions."""
+    """Aggregate both outcome legs from list_positions.
+
+    `valid=False` means the read itself failed. A successful empty response is valid and
+    means zero current position for the condition.
+    """
     up_sh = down_sh = 0.0
     up_tok = down_tok = None
     redeemable = False
     mergeable = False
     neg_risk = False
+    valid = True
     try:
         paginator = client.list_positions(market=[condition_id], size_threshold=0.0)
         async for page in paginator:
@@ -58,7 +59,8 @@ async def fetch_holding(client, condition_id: str) -> ConditionHolding:
                 redeemable = redeemable or bool(getattr(pos, "redeemable", False))
                 mergeable = mergeable or bool(getattr(pos, "mergeable", False))
                 neg_risk = neg_risk or bool(getattr(pos, "negative_risk", False))
-    except Exception as exc:  # noqa: BLE001 — caller treats zeros as "unknown, skip"
+    except Exception as exc:  # noqa: BLE001
+        valid = False
         log.warning("positions fetch failed for %s: %s", condition_id[:12], exc)
 
     return ConditionHolding(
@@ -70,18 +72,12 @@ async def fetch_holding(client, condition_id: str) -> ConditionHolding:
         redeemable=redeemable,
         mergeable_flag=mergeable,
         neg_risk=neg_risk,
+        valid=valid,
     )
 
 
 async def fetch_pusd_balance(client) -> float:
-    """Wallet's spendable pUSD (whole dollars). CLOB API first, on-chain fallback.
-
-    New Polymarket Deposit Wallets require signature_type=3 (POLY_1271) for
-    the CLOB API to report the correct balance. If the SDK uses the wrong type,
-    the CLOB reports $0 even when on-chain funds exist. The fallback queries
-    the pUSD ERC-20 contract directly via a public Polygon RPC.
-    """
-    # 1. CLOB API (primary — handles proxy/safe wallets correctly)
+    """Wallet spendable pUSD. CLOB API first, direct Polygon call as fallback."""
     try:
         ba = await client.get_balance_allowance(asset_type="COLLATERAL")
         bal = float(ba.balance) / 1e6
@@ -90,7 +86,6 @@ async def fetch_pusd_balance(client) -> float:
     except Exception as exc:  # noqa: BLE001
         log.warning("CLOB balance fetch failed: %s", exc)
 
-    # 2. On-chain fallback for deposit wallets (signature_type mismatch fix)
     wallet = getattr(client, "wallet", "") or ""
     if wallet:
         onchain = await _fetch_pusd_onchain(wallet)
@@ -103,14 +98,12 @@ async def fetch_pusd_balance(client) -> float:
 
 
 async def _fetch_pusd_onchain(wallet_address: str) -> float | None:
-    """Query pUSD ERC-20 balance directly from Polygon via eth_call."""
     try:
         import httpx
     except ImportError:
         log.warning("httpx not available for on-chain balance fallback")
         return None
 
-    # keccak256("balanceOf(address)")[:4]
     data = "0x70a08231" + wallet_address[2:].lower().rjust(64, "0")
     payload = {
         "jsonrpc": "2.0",
@@ -126,7 +119,6 @@ async def _fetch_pusd_onchain(wallet_address: str) -> float | None:
                 raw = result.get("result", "")
                 if raw:
                     return int(raw, 16) / 1e6
-        except Exception:  # noqa: BLE001 — try next RPC
+        except Exception:  # noqa: BLE001
             continue
-
     return None
