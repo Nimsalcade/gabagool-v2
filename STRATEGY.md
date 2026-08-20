@@ -1,96 +1,113 @@
-# Strategy ground truth
+# Strategy ground truth — full forensic decode
 
-This document separates observations in the gabagool22 activity sample from
-implementation hypotheses. It is the evidence baseline for this project; a
-behavior should not be described as measured unless the source data establishes
-it.
+This document is the evidence boundary for the replica. It supersedes the earlier
+3.83-day sample reconstruction.
 
-## Evidence base
+## Full evidence base
 
-The sample contains 141,658 executed records over 3.83 days (October 29 through
-November 1) for wallet `0x6031b6…f96d`. It covers **916 BTC/ETH Up-or-Down
-markets: 734 15-minute markets and 182 hourly markets**. The 916-market total
-must not be described as 916 15-minute windows.
+The completed Polygon `OrderFilled` decode contains **12,921,881 exact executions**
+across the Gabagool22 activity period. All executions mapped to official Polymarket
+market metadata; **12,921,880 were BUY and one was SELL**.
 
-## Measured economic behavior
+Execution role:
 
-* Participation was two-sided in 99.9% of sampled markets.
-* Aggregate potential matched-share coverage was approximately **94.7%**, so
-  approximately **5.3%** of purchased outcome shares were unmatched. Median
-  market balance was approximately **90.9%**.
-* Aggregate UP-plus-DOWN acquisition VWAP was approximately **$0.97**, and 87.8%
-  of markets had a combined entry VWAP below $1.00.
-* No CLOB `SELL` activity was observed. Matched inventory exited through CTF
-  `MERGE`; residual winning inventory exited through `REDEEM` after resolution.
-* The first sample recorded approximately **232,415 complete-set merges**. The
-  roughly 478,000–500,000 purchased outcome shares are not the same unit as
-  complete pairs: one pair consumes one UP share and one DOWN share.
-* Execution was frequent and small (approximately 1,537 buys per hour and a
-  $3.60 median order).
+- maker: **11,042,283 (85.45%)**
+- taker/aggressive: **1,879,598 (14.55%)**
 
-Matchability is an aggregate result, not evidence of equal-sized fills or equal
-inventory in every market. For example, 70 UP shares and 87 DOWN shares produce
-70 mergeable pairs and a residual of 17 DOWN shares. A replica must therefore
-allow asynchronous fills and temporary, natural asymmetry rather than treating
-every action as an atomic equal-quantity pair.
+The public market inventory contains **28,620 conditions**, with 28,586 two-outcome
+BUY markets. Full-period terminal combined side VWAP had median **0.985117**, p90
+**1.002805**, and p95 **1.010720**. Terminal larger/smaller inventory ratio had median
+**1.013584**, p90 **1.055304**, and p95 **1.082311**.
 
-## Economic reconstruction
+## Timing
 
-The strongest reconstruction supported by those measurements is:
+First successful fill after market open:
 
-1. acquire UP and DOWN inventory asynchronously through many small BUY fills;
-2. tolerate temporary quantity imbalance while aggregate cost bases evolve;
-3. match an opposite share against roughly 95% of purchased shares;
-4. merge matched complete sets for $1 each; and
-5. redeem a remaining winning outcome after resolution.
+- 5m: median 15s, p90 23s
+- 15m: median 20s, p90 35s
 
-The edge does **not** require simultaneously executable UP and DOWN prices below
-$1. A fill of 10 UP at $0.37 at one time and 10 DOWN at $0.58 later constructs
-10 complete sets at a $0.95 acquisition cost. Time and inventory are part of
-the construction.
+Last successful fill age:
 
-A rough scale check using the observed mean pair cost is:
+- 5m: median 273s, p90 296s, p95 297s
+- 15m: median 794s, p90 893s, p95 897s
 
-```text
-$1.0000 - $0.9715 = $0.0285 gross edge per complete pair
-232,415 pairs * $0.0285 = approximately $6,624 gross edge
-```
+Therefore the reference trader often continued receiving maker fills within only a
+few seconds of expiration. A large fixed pre-close shutdown buffer is not faithful.
 
-This is not a PnL calculation. Actual PnL must be derived from quantity-weighted
-fills, merges, and redemptions at market level, rather than multiplying
-headline averages. In particular, multiplying 500,000 *pairs* by an average
-edge incorrectly counts outcome shares as pairs and overstates volume by about
-two times.
+## Inventory / taker policy
 
-## What remains inferred or unknown
+Taker share rises with pre-fill inventory imbalance:
 
-The activity history is consistent with passive liquidity provision, but fills
-alone do not establish GTC, post-only or maker status, an exact resting ladder,
-queue placement, or latency advantage. Those claims require order-type or
-maker/taker metadata.
+- ratio <1.05: ~13.17%
+- 1.05-1.10: ~16.01%
+- 1.10-1.25: ~17.31%
+- 1.25-1.50: ~18.42%
+- 1.50-2.00: ~18.72%
 
-The sample also does not reveal the policy governing:
+Taker share also rose as the nearest prior **opposite-outcome** fill became stale:
+~9.8% at <=0s, ~13.7% at 1-5s, ~15.7% at 5-15s, ~17.4% at 15-30s, and ~18.2%
+at 30-60s. Taker share fell sharply into expiry.
 
-* permitted imbalance and inventory by market stage;
-* when heavy-side quoting is reduced, retained, or stopped;
-* price distribution, ladder depth, and repricing;
-* how aggressively the light side is pursued; or
-* merge timing.
+These are conditional fingerprints, not proof of the exact hidden trigger formula.
+The replica therefore preserves the monotonic relationships while keeping the
+exact trigger implementation explicit and testable.
 
-Consequently, this repository's post-only GTC orders, fair-split targets,
-combined-budget cap, imbalance thresholds, and merge cadence are **replica
-implementation choices**, not measured gabagool22 parameters. Tests may assert
-the safety properties of those choices, but must not present equal fresh-pair
-sizes or a strict per-quote $0.97 pairing rule as forensic ground truth.
+## Economic policy
 
-## Locked statement
+The previous replica enforced a permanent `UP bid + DOWN bid <= 0.97` rule. The full
+history disproves that as a forensic invariant. The reference trader sometimes took
+fills whose simple incremental pair proxy exceeded $1 and still finished with favorable
+aggregate inventory economics.
 
-> Gabagool22 is an inventory-centric, market-neutral complete-set liquidity
-> strategy. It acquires both outcomes asynchronously through many small BUY
-> fills, tolerates temporary quantity imbalance, and achieves roughly 95%
-> aggregate share matchability while maintaining an aggregate UP+DOWN
-> acquisition VWAP near $0.97. Matched inventory is exited through CTF MERGE
-> rather than CLOB SELL; residual winning inventory is redeemed after
-> resolution. The available activity history establishes these economic
-> behaviors but does not reveal the exact resting-order ladder, repricing
-> policy, queue strategy, or latency infrastructure.
+The active replica must therefore manage:
+
+- UP quantity and cost basis;
+- DOWN quantity and cost basis;
+- aggregate `UP_VWAP + DOWN_VWAP`;
+- inventory ratio;
+- fill staleness;
+- time remaining;
+- maker vs taker execution mode.
+
+It must not treat every fill as an atomic complete set.
+
+## Order size / price behavior
+
+Executed clips overwhelmingly fall in the 5-50 share range, with 10-20 shares dominant.
+Across 57,240 market-sides the median number of distinct **executed** price levels was
+53 (p90 ~97). This proves highly adaptive execution but does not reveal every cancelled
+or unfilled quote.
+
+## Settlement
+
+Matched UP+DOWN inventory exits via CTF MERGE, residual winners through REDEEM. The
+expanded official history contains about **$71.236M** of MERGE activity. Roughly 99.5%
+of merge transactions covered multiple markets; most 5m and 15m merge records occurred
+after close. The replica therefore holds matched inventory through the live window and
+settles after close rather than merging every 20 seconds.
+
+## Representative 5-minute market
+
+One median-notional BTC 5m market (Feb 14, 2026 2:05-2:10 AM ET) produced:
+
+- 292 exact BUY executions / 227 filled order hashes
+- $1,356.685 total spend
+- 284 maker / 8 taker fills
+- 1,363.536 matched shares
+- terminal combined VWAP 0.992764
+- terminal inventory ratio 1.004599
+- $1,363.517 observed settlement cash
+- **+$6.832 gross realized P&L before the final net fee/rebate join**
+
+## Still unknown
+
+`OrderFilled` cannot reveal:
+
+- exact unfilled quote prices;
+- cancellation/replacement frequency;
+- queue position;
+- precise spread-distance rule;
+- the exact stochastic/deterministic taker trigger.
+
+Those remaining dimensions must be calibrated in paper/live observation against the
+measured fingerprints above. They must not be silently presented as forensic facts.
