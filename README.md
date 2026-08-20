@@ -16,12 +16,14 @@ See [`STRATEGY.md`](STRATEGY.md) for the full evidence boundary.
 - removed the fixed `$0.97` pair-budget strategy invariant;
 - added `src/policy.py` with aggregate VWAP, imbalance, opposite-fill lag and expiry controls;
 - enabled selective non-post-only BUY repair orders;
-- maker quotes continue until ~T-2s; taker aggression stops earlier;
+- maker quotes continue until ~T-2s; taker aggression fades into the close;
 - added 5m + 15m discovery and BTC/ETH/SOL/XRP candidate support;
 - removed continuous intra-window merging; closed markets enter a settlement sweep;
 - fixed capital accounting so cumulative turnover is not mistaken for permanent global exposure;
 - wired authoritative fills into the SQLite `fills` table;
-- updated tests to assert measured policy structure instead of the disproven fixed-budget hypothesis.
+- updated tests to assert measured policy structure instead of the disproven fixed-budget hypothesis;
+- added a public-tape **shadow mode** that estimates hypothetical maker fills from real market
+  trades and visible queue ahead without submitting any orders.
 
 ## Safety boundary
 
@@ -33,6 +35,43 @@ behavior down.
 The live merge-proof gate, heartbeat, authoritative fill reconciliation, and on-chain
 merge verification remain in place.
 
+## Three validation levels
+
+### 1. Unit/integration tests
+
+```bash
+make test
+```
+
+These verify deterministic policy, accounting, queue-model, fill-reconciliation, and
+safety invariants.
+
+### 2. Synthetic dry-run — plumbing only
+
+```bash
+make dry
+```
+
+`--dry-run` deliberately uses deterministic synthetic fills so every branch of the
+pipeline is exercised. **Do not compare its P&L, maker/taker share, inventory ratio, or
+fill count to Gabagool.** Synthetic fills are not a market simulator.
+
+### 3. Live public-tape shadow — behavioral validation
+
+```bash
+python -m tools.shadow_market --asset btc --duration 300
+```
+
+This submits **zero orders**. It reads a live 5m BTC book and last-trade stream, places
+hypothetical maker quotes in memory, tracks visible queue ahead, estimates maker fills when
+real aggressive SELL trades consume that queue, and simulates taker FAKs only against
+visible best-ask depth. The output is suitable for comparison with the forensic
+fingerprints.
+
+Shadow mode is still an estimator: cancellations ahead of a hypothetical order and exact
+hidden queue priority are not fully observable. It is therefore a validation instrument,
+not proof of live fill probability.
+
 ## Quick start
 
 ```bash
@@ -42,9 +81,13 @@ make test
 cp .env.example .env
 set -a; source .env; set +a
 
+# no credentials / no money required
+make dry
+python -m tools.shadow_market --asset btc --duration 300
+
+# authenticated preflight and settlement proof only after shadow validation
 make check
 make merge-proof
-make dry
 
 # live remains explicitly gated
 make live
@@ -80,8 +123,8 @@ current 5m/15m crypto markets
 
 ## Validation target
 
-A replica is not considered converged merely because it makes money. Paper/live telemetry
-must be compared against the reference fingerprints: maker/taker share, taker share by
-imbalance, taker share by opposite-fill lag and time remaining, clip distribution, first/
-last fill timing, terminal inventory ratio, combined VWAP, distinct executed price levels,
-market spend, and settlement timing.
+A replica is not considered converged merely because it makes money. Shadow/paper/live
+telemetry must be compared against the reference fingerprints: maker/taker share, taker
+share by imbalance, taker share by opposite-fill lag and time remaining, clip distribution,
+first/last fill timing, terminal inventory ratio, combined VWAP, distinct executed price
+levels, market spend, and settlement timing.
