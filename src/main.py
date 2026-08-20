@@ -1,18 +1,11 @@
+"""Entry point for the forensic-calibrated Gabagool replica.
+
+    python -m src.main --dry-run
+    python -m src.main --live
+
+Live mode still requires a fresh, real split->merge proof. Strategy reconstruction never
+weakens the operational safety gate.
 """
-Entry point.
-
-    python -m src.main --dry-run          # full pipeline, no real orders/txs
-    python -m src.main --live             # requires .merge_proof (see below)
-
-THE MERGE-PROOF GATE
---------------------
-The exit mechanism is the strategy. So this bot REFUSES to trade live until
-`python -m tools.test_merge` has performed a real ~$1 split→merge round trip
-on-chain and written `.merge_proof`. The old bot bought $3,500 of inventory
-against an exit door that had never once opened; this gate makes that
-sequence impossible to repeat.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -34,10 +27,8 @@ MERGE_PROOF = Path(".merge_proof")
 
 
 def _setup_logging(level: str) -> None:
-    # Silence HTTP request spam
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-
     handler = logging.StreamHandler()
     handler.setFormatter(_ColoredFormatter())
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -45,8 +36,6 @@ def _setup_logging(level: str) -> None:
 
 
 class _ColoredFormatter(logging.Formatter):
-    """Color-code important lines; dim the noise."""
-
     BOLD = "\033[1m"
     GREY = "\033[2m"
     GREEN = "\033[32m"
@@ -57,71 +46,31 @@ class _ColoredFormatter(logging.Formatter):
     MAGENTA = "\033[35m"
     RESET = "\033[0m"
 
-    COLOR_BY_NAME: dict[str, str] = {
-        "merge_engine": GREEN,
-        "fills": CYAN,
-        "capital": YELLOW,
-    }
-
     def format(self, record: logging.LogRecord) -> str:
         msg = record.getMessage()
         color = self.RESET
-
-        # Merge events
         if record.name == "merge_engine":
-            if "MERGED" in msg:
-                color = self.BOLD + self.GREEN
-            elif "FAIL" in msg:
-                color = self.BOLD + self.RED
-
-        # Fills
+            color = self.BOLD + (self.GREEN if "MERGED" in msg else self.RED if "FAIL" in msg else self.RESET)
         elif record.name == "fills":
             color = self.CYAN
-
-        # Window lifecycle
         elif record.name.startswith("maker."):
             if "window start" in msg or "window done" in msg:
                 color = self.BOLD + self.BLUE
-            elif "imbalance brake" in msg:
-                color = self.MAGENTA
-            elif "order rejected" in msg or "backing off" in msg:
+            elif "TAKER" in msg:
+                color = self.BOLD + self.MAGENTA
+            elif "order rejected" in msg:
                 color = self.GREY
-            elif "FILL" in msg:
-                color = self.CYAN
             elif "HOLD" in msg:
                 color = self.BOLD + self.YELLOW
-
-        # Capital / kill switch
         elif record.name == "capital":
-            if "kill" in msg.lower():
-                color = self.BOLD + self.RED
-            else:
-                color = self.YELLOW
-
-        # Merge session total
-        elif "MERGE SESSION" in msg:
-            color = self.BOLD + self.GREEN
-
-        # Reconciliation
-        elif "RECONCILIATION" in msg:
-            color = self.BOLD + self.BLUE
-
-        # Window manager
+            color = self.BOLD + self.RED if "kill" in msg.lower() else self.YELLOW
         elif record.name == "window_manager":
-            if "REDEEMED" in msg:
+            if "REDEEM" in msg:
                 color = self.BOLD + self.MAGENTA
             elif "launched" in msg:
                 color = self.BLUE
-
-        # SDK
-        elif record.name == "sdk":
-            if "Non-fatal" in msg:
-                color = self.GREY
-
-        # Heartbeat / ops
         elif record.name in ("ops", "heartbeat"):
             color = self.GREY
-
         time_str = self.formatTime(record, "%H:%M:%S")
         return f"{self.GREY}{time_str}{self.RESET} {color}{msg}{self.RESET}"
 
@@ -141,15 +90,18 @@ async def amain(cfg: BotConfig) -> int:
             logging.info("wallet %s | pUSD $%.2f", bc.wallet, bal)
             if bal < cfg.capital.min_starting_pusd:
                 logging.error(
-                    "pUSD balance $%.2f below min_starting_pusd $%.2f — "
-                    "fund the wallet (or lower the floor) and restart.",
-                    bal, cfg.capital.min_starting_pusd,
+                    "pUSD balance $%.2f below min_starting_pusd $%.2f — fund or adjust floor",
+                    bal,
+                    cfg.capital.min_starting_pusd,
                 )
                 return 2
             ledger.record_balance(bal)
             if cfg.heartbeat:
                 heartbeat = Heartbeat(
-                    cfg.private_key, client.credentials, bc.wallet, signature_type=3
+                    cfg.private_key,
+                    client.credentials,
+                    bc.wallet,
+                    signature_type=cfg.clob_signature_type,
                 )
                 await heartbeat.start()
 
@@ -170,19 +122,20 @@ async def amain(cfg: BotConfig) -> int:
 
 
 async def _public_ish_client(cfg: BotConfig):
-    """Dry-run still needs real market data; a key is NOT required."""
     if cfg.private_key:
         from .sdk import build_secure_client as _b
         try:
             return (await _b(cfg)).client
-        except Exception:  # noqa: BLE001 — fall through to public reads
+        except Exception:  # noqa: BLE001
             pass
     from polymarket import AsyncPublicClient
     return AsyncPublicClient()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Gabagool v2 — pure spread farmer")
+    ap = argparse.ArgumentParser(
+        description="Gabagool V3 — forensic-calibrated complete-set accumulation engine"
+    )
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
@@ -190,7 +143,7 @@ def main() -> None:
     ap.add_argument(
         "--i-understand-no-merge-proof",
         action="store_true",
-        help="bypass the merge-proof gate (NOT recommended)",
+        help="bypass merge-proof gate (not recommended)",
     )
     args = ap.parse_args()
 
@@ -211,10 +164,8 @@ def main() -> None:
             sys.exit(2)
         if not MERGE_PROOF.exists() and not args.i_understand_no_merge_proof:
             print(
-                "REFUSING TO GO LIVE: no .merge_proof found.\n"
-                "Run `python -m tools.test_merge` first — it performs a ~$1\n"
-                "split→merge round trip on-chain and writes the proof file.\n"
-                "The exit mechanism must be demonstrated before any entry is made.",
+                "REFUSING LIVE MODE: no .merge_proof found.\n"
+                "Run `python -m tools.test_merge` first.",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -229,7 +180,7 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _stop)
-        except NotImplementedError:  # windows
+        except NotImplementedError:
             signal.signal(sig, _stop)
 
     try:

@@ -1,4 +1,4 @@
-"""Fill reconciliation tests: cancels are NEVER fills; partials are exact."""
+"""Fill reconciliation tests: cancels are never fills; taker cost uses trade price."""
 import asyncio
 import sys
 from pathlib import Path
@@ -39,11 +39,14 @@ class _MakerOrder:
 
 
 class _Trade:
-    def __init__(self, maker_orders, status="CONFIRMED", taker_order_id="", size=0):
-        self.maker_orders = maker_orders
+    def __init__(
+        self, maker_orders=None, *, status="CONFIRMED", taker_order_id="", size=0, price=.5
+    ):
+        self.maker_orders = maker_orders or []
         self.status = status
         self.taker_order_id = taker_order_id
         self.size = size
+        self.price = price
 
 
 class FakeClient:
@@ -59,14 +62,13 @@ class FakeClient:
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_cancel_is_not_a_fill():
     c = FakeClient()
     t = FillTracker(condition_id="0xc0nd")
-    t.register("o1", "UP", "tokU", 0.45, 10)
-    # order vanished from the book, zero trades attributed → cancel
+    t.register("o1", "UP", "tokU", .45, 10)
     c.open_orders, c.trades = [], []
     got = run(t.reconcile(c))
     assert got == 0.0
@@ -76,27 +78,55 @@ def test_cancel_is_not_a_fill():
 def test_partial_fill_via_size_matched_then_full_via_trades():
     c = FakeClient()
     t = FillTracker(condition_id="0xc0nd")
-    t.register("o1", "UP", "tokU", 0.45, 10)
+    t.register("o1", "UP", "tokU", .45, 10)
 
-    c.open_orders = [_OpenOrder("o1", 4)]            # partial while resting
+    c.open_orders = [_OpenOrder("o1", 4)]
     run(t.reconcile(c))
     assert abs(t.up.shares - 4) < 1e-9
+    assert abs(t.up.cost - 1.8) < 1e-9
 
-    c.open_orders = []                                # left the book…
-    c.trades = [_Trade([_MakerOrder("o1", 10)])]      # …trades say 10 total
+    c.open_orders = []
+    c.trades = [_Trade([_MakerOrder("o1", 10)], price=.70)]
     run(t.reconcile(c))
     assert abs(t.up.shares - 10) < 1e-9
+    # Maker leg costs at its own order price, not the taker's displayed trade object price.
     assert abs(t.up.cost - 4.5) < 1e-9
 
 
 def test_failed_trades_do_not_count():
     c = FakeClient()
     t = FillTracker(condition_id="0xc0nd")
-    t.register("o2", "DOWN", "tokD", 0.50, 8)
-    c.open_orders = []
+    t.register("o2", "DOWN", "tokD", .50, 8)
     c.trades = [_Trade([_MakerOrder("o2", 8)], status="FAILED")]
     run(t.reconcile(c))
     assert t.down.shares == 0.0
+
+
+def test_taker_fak_can_index_late_and_uses_actual_trade_vwap():
+    c = FakeClient()
+    t = FillTracker(condition_id="0xc0nd")
+    t.register("t1", "DOWN", "tokD", .55, 10, mode="taker")
+
+    # FAK is gone immediately but trades API has not indexed it yet.
+    c.open_orders, c.trades = [], []
+    run(t.reconcile(c))
+    assert t.down.shares == 0
+    assert not t.orders["t1"].finalized
+
+    # Next reconcile sees two fills totaling 10 shares at exact $5.30 cost.
+    c.trades = [
+        _Trade(taker_order_id="t1", size=4, price=.52),
+        _Trade(taker_order_id="t1", size=6, price=.54),
+    ]
+    got = run(t.reconcile(c))
+    assert abs(t.down.shares - 10) < 1e-9
+    assert abs(t.down.cost - 5.32) < 1e-9
+    assert abs(got - 5.32) < 1e-9
+
+    # Re-reading the same cumulative trade set must not double count.
+    got2 = run(t.reconcile(c))
+    assert got2 == 0.0
+    assert abs(t.down.shares - 10) < 1e-9
 
 
 def test_matched_pairs_math():

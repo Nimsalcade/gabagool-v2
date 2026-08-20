@@ -1,31 +1,39 @@
-.PHONY: install test dry check merge-proof live cancel positions redeem harvest
+PYTHON ?= python3
 
-install:
-	pip install -r requirements.txt
+.PHONY: check-python install test dry shadow check merge-proof live cancel positions redeem harvest
 
-test:
-	python -m pytest tests/ -q
+check-python:
+	@$(PYTHON) -c 'import sys; req=(3,11); cur=sys.version_info[:2]; assert cur >= req, f"Python >=3.11 required, found {sys.version.split()[0]} at {sys.executable}"'
 
-dry:
-	python -m src.main --dry-run
+install: check-python
+	$(PYTHON) -m pip install -r requirements.txt
 
-check:
-	python -m tools.check_setup
+test: check-python
+	$(PYTHON) -m pytest tests/ -q
 
-merge-proof:
-	python -m tools.test_merge
+dry: check-python
+	$(PYTHON) -m src.main --dry-run
 
-live: 
-	python -m src.main --live
+shadow: check-python
+	$(PYTHON) -m tools.shadow_market --asset btc --duration 300
 
-cancel:
-	python -m tools.cancel_all
+check: check-python
+	$(PYTHON) -m tools.check_setup
 
-positions:
-	python -m tools.show_positions
+merge-proof: check-python
+	$(PYTHON) -m tools.test_merge
 
-redeem:
-	python -m tools.redeem_all
+live: check-python
+	$(PYTHON) -m src.main --live
 
-harvest:
-	python -m tools.harvest --merge
+cancel: check-python
+	$(PYTHON) -m tools.cancel_all
+
+positions: check-python
+	$(PYTHON) -m tools.show_positions
+
+redeem: check-python
+	$(PYTHON) -m tools.redeem_all
+
+harvest: check-python
+	$(PYTHON) -m tools.harvest --merge

@@ -1,16 +1,10 @@
 """
-Merge proof: a ~$1 on-chain round trip that exercises the EXACT pipeline the
-bot uses to realize profit, with no order placement and no market risk.
+Merge proof: a ~$1 on-chain round trip that exercises the exact settlement pipeline.
 
-    pUSD --split_position--> 1 Up + 1 Down --merge_positions--> pUSD
+    pUSD -> split_position -> 1 Up + 1 Down -> merge_positions -> pUSD
 
-If this passes, every link is proven: relayer auth, wallet binding, pUSD
-collateral-adapter routing, approvals, and on-chain position accounting.
-On success it writes `.merge_proof`, which `--live` requires.
-
-Run:  python -m tools.test_merge
+No order is placed. On success `.merge_proof` is written; live mode requires it.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -21,12 +15,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.config import BotConfig, ConfigError          # noqa: E402
-from src.discovery import discover                      # noqa: E402
+from src.config import BotConfig, ConfigError  # noqa: E402
+from src.discovery import discover  # noqa: E402
 from src.inventory import fetch_holding, fetch_pusd_balance  # noqa: E402
 from src.sdk import build_secure_client, ensure_trading_approvals  # noqa: E402
 
-AMOUNT_PAIRS = 1            # 1 pair = $1.00 of pUSD through the round trip
+AMOUNT_PAIRS = 1
 AMOUNT_MICRO = AMOUNT_PAIRS * 1_000_000
 
 
@@ -55,10 +49,10 @@ async def main() -> int:
             return 2
 
         print("4/6  Picking a live 15m market for the round trip…")
-        markets = await discover(client, ("btc", "eth"))
+        markets = await discover(client, ("btc", "eth"), (900,))
         live = [m for m in markets if m.accepting_orders and m.seconds_to_end > 180]
         if not live:
-            print("     No live window found right now — retry in a minute.")
+            print("     No live 15m window found right now — retry in a minute.")
             return 2
         m = live[0]
         print(f"     using {m.slug} | condition {m.condition_id[:16]}…")
@@ -80,7 +74,10 @@ async def main() -> int:
         after = await _settled_holding(client, m.condition_id, want_min_pairs=0)
         bal1 = await fetch_pusd_balance(client)
         ok = after.pairs < holding.pairs and (bal1 >= bal0 - 0.02)
-        print(f"     pUSD after: ${bal1:.2f} (Δ {bal1 - bal0:+.4f}) | pairs {holding.pairs:g}→{after.pairs:g}")
+        print(
+            f"     pUSD after: ${bal1:.2f} (Δ {bal1 - bal0:+.4f}) | "
+            f"pairs {holding.pairs:g}→{after.pairs:g}"
+        )
 
         if ok:
             Path(".merge_proof").write_text(json.dumps({
@@ -89,30 +86,21 @@ async def main() -> int:
                 "condition_id": m.condition_id,
                 "merge_tx": str(tx),
             }, indent=2))
-            print("\n✅ MERGE PROOF PASSED — .merge_proof written. You may run --live.")
+            print("\nMERGE PROOF PASSED — .merge_proof written.")
             return 0
-        print("\n❌ Merge transaction confirmed but on-chain deltas don't verify. "
-              "Do NOT trade live; investigate the tx on polygonscan first.")
+        print("\nMerge confirmed but on-chain deltas do not verify. Do NOT trade live.")
         return 1
     finally:
         await client.close()
 
 
 async def _settled_holding(client, condition_id: str, *, want_min_pairs: float):
-    """Poll until on-chain positions reflect the expected minimum pairs.
-
-    When want_min_pairs > 0 (after split): wait for at least that many pairs.
-    When want_min_pairs == 0 (after merge): wait for the Data API to catch up,
-    polling until positions are gone or we've given the indexer enough time.
-    """
     holding = await fetch_holding(client, condition_id)
     for _ in range(8):
         if want_min_pairs > 0:
-            # After split — wait until pairs appear on-chain
             if holding.pairs >= want_min_pairs and (holding.up_shares or holding.down_shares):
                 break
         else:
-            # After merge — wait until Data API sees the merge (pairs gone)
             if holding.pairs == 0 and not holding.up_shares and not holding.down_shares:
                 break
         await asyncio.sleep(3)
