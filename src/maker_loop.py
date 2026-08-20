@@ -1,12 +1,14 @@
-"""Per-market mixed maker/taker accumulation engine.
+"""Per-market mixed maker/taker complete-set accumulation engine.
 
-Measured historical behavior this loop is designed to reproduce:
-- almost exclusively BUY both outcomes;
-- maker-dominant execution with a material taker repair layer;
-- aggregate cost-basis management rather than a fixed per-quote pair cap;
-- tight terminal inventory balance;
-- maker quoting continues to the final seconds while taker aggression fades earlier;
-- no intra-window MERGE. Settlement is owned by WindowManager after close.
+Evidence-backed structure:
+- BUY both outcomes; no directional signal and no routine CLOB SELL path;
+- maker-dominant quoting plus a selective aggressive BUY layer;
+- decisions use aggregate UP/DOWN cost basis, inventory ratio, fill timing and expiry;
+- maker quoting stays active until the final seconds while aggressive execution fades earlier;
+- settlement is post-close and owned by WindowManager.
+
+The exact historical cancellation/queue algorithm is not observable from OrderFilled, so
+maker placement remains an explicit calibration surface rather than a claimed fact.
 """
 from __future__ import annotations
 
@@ -60,7 +62,6 @@ class WindowResult:
 class _SideQuote:
     order_id: str | None = None
     price: float | None = None
-    mode: str = "maker"
     last_post: float = 0.0
 
 
@@ -78,6 +79,7 @@ class MakerLoop:
         self._tick = FALLBACK_TICK
         self._min_shares = FALLBACK_MIN_ORDER_SHARES
         self._dry_cycle = 0
+        self._taker_pending_until = {"UP": 0.0, "DOWN": 0.0}
         self.log = logging.getLogger(
             f"maker.{market.asset}.{market.duration_s}.{market.window_start % 100000}"
         )
@@ -96,7 +98,7 @@ class MakerLoop:
 
                 entry_delay = float(self.cfg.entry_delay_by_duration_s.get(m.duration_s, 10.0))
                 if m.age_seconds < entry_delay:
-                    await asyncio.sleep(min(1.0, entry_delay - m.age_seconds))
+                    await asyncio.sleep(min(1.0, max(0.05, entry_delay - m.age_seconds)))
                     continue
 
                 if remaining <= self.cfg.stop_posting_buffer_s and state is State.FARM:
@@ -109,9 +111,7 @@ class MakerLoop:
                     await self._farm_tick()
                 elif state is State.HOLD:
                     if not self.dry_run:
-                        filled_notional = await self.tracker.reconcile(self.client)
-                        if filled_notional:
-                            self.capital.on_spend(m.condition_id, filled_notional)
+                        await self._reconcile_spend()
                     await asyncio.sleep(min(0.25, max(0.05, remaining)))
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
@@ -120,10 +120,13 @@ class MakerLoop:
         finally:
             await self._cancel_all_safe()
             if not self.dry_run:
-                filled_notional = await self.tracker.reconcile(self.client)
-                if filled_notional:
-                    self.capital.on_spend(m.condition_id, filled_notional)
+                await self._reconcile_spend()
         return self._finish(ts_open)
+
+    async def _reconcile_spend(self) -> None:
+        filled_notional = await self.tracker.reconcile(self.client)
+        if filled_notional:
+            self.capital.on_spend(self.market.condition_id, filled_notional)
 
     async def _wait_ready_tick(self, state: State) -> State:
         if not self.backoff.ready("ready"):
@@ -160,17 +163,14 @@ class MakerLoop:
         up_book, down_book = pair
 
         if not self.dry_run:
-            filled_notional = await self.tracker.reconcile(self.client)
-            if filled_notional:
-                self.capital.on_spend(self.market.condition_id, filled_notional)
+            await self._reconcile_spend()
 
         self.capital.update_resting(
             self.market.condition_id, self.tracker.resting_notional()
         )
         state = self._state()
 
-        # Repair first. A marketable limit is permitted only when aggregate basis
-        # and inventory/staleness state justify it.
+        # Aggressive execution is an inventory/economic intervention, never the default.
         if self.cfg.taker_enabled and await self._maybe_taker(state, up_book, down_book):
             await asyncio.sleep(self.cfg.requote_interval_s)
             return
@@ -198,14 +198,15 @@ class MakerLoop:
     async def _maybe_taker(
         self, state: InventoryState, up_book: BookSide, down_book: BookSide
     ) -> bool:
-        # Build the initial two-sided base passively.
+        # Build an initial two-sided base passively. Taker logic starts only once
+        # there is inventory state to repair/evaluate.
         if state.up_shares <= 0 and state.down_shares <= 0:
             return False
 
         deficient = state.deficient_side
         candidates = [deficient] if deficient else ["UP", "DOWN"]
         for side in candidates:
-            if side is None:
+            if side is None or time.time() < self._taker_pending_until[side]:
                 continue
             book = up_book if side == "UP" else down_book
             relation = relation_for_side(state, side)
@@ -214,21 +215,22 @@ class MakerLoop:
                 and state.combined_vwap <= self.cfg.target_combined_vwap - 0.01
             ):
                 continue
-            price = tick_floor(book.best_ask, self._tick)
-            if price <= 0 or price >= 1:
+
+            max_price = tick_floor(book.best_ask, self._tick)
+            if max_price <= 0 or max_price >= 1:
                 continue
             shares = adaptive_clip(
                 base_clip_shares=self.cfg.base_clip_shares,
                 max_clip_shares=self.cfg.max_clip_shares,
                 min_order_shares=self._min_shares,
                 min_notional=MIN_ORDER_NOTIONAL_USD,
-                price=price,
+                price=max_price,
                 ratio=state.larger_to_smaller_ratio,
                 relation=relation,
                 aggressive=True,
             )
             projected = projected_combined_vwap(
-                state, side=side, price=price, shares=shares
+                state, side=side, price=max_price, shares=shares
             )
             if not taker_should_fire(
                 state,
@@ -242,7 +244,7 @@ class MakerLoop:
             if not basis_allows(
                 state,
                 side=side,
-                price=price,
+                price=max_price,
                 shares=shares,
                 max_combined_vwap=self.cfg.max_combined_vwap,
                 opposite_reference_price=(
@@ -251,51 +253,53 @@ class MakerLoop:
                 initial_pair_ceiling=self.cfg.initial_pair_ceiling,
             ):
                 continue
+
+            notional = max_price * shares
             if not self.capital.can_commit(
                 self.market.condition_id,
                 self.tracker.total_cost(),
                 self.tracker.resting_notional(),
-                price * shares,
+                notional,
             ):
                 continue
             held = self.tracker.up.shares if side == "UP" else self.tracker.down.shares
             if held + shares > self.cfg.max_shares_per_side:
                 continue
 
+            # Cancel same-side maker first so the intervention cannot accidentally
+            # stack an aggressive buy on top of a stale resting quote.
             await self._cancel_side(side)
             token_id = self.market.up_token_id if side == "UP" else self.market.down_token_id
-            oid = await self._post_buy(
-                token_id,
-                side,
-                price,
-                shares,
-                post_only=False,
-                mode="taker",
+            oid = await self._post_taker_buy(
+                token_id=token_id,
+                side=side,
+                max_price=max_price,
+                planned_shares=shares,
             )
             if oid:
-                self._sides[side] = _SideQuote(oid, price, "taker", time.time())
                 self.tracker.register(
                     oid,
                     side,
                     token_id,
-                    price,
+                    max_price,
                     shares,
                     mode="taker",
                 )
                 if self.ledger is not None:
                     self.ledger.record_order(
-                        oid, self.market.condition_id, side, price, shares
+                        oid, self.market.condition_id, side, max_price, shares
                     )
-                self.capital.update_resting(
-                    self.market.condition_id, self.tracker.resting_notional()
-                )
+                # Give the FAK/trades index time to settle before another repair on
+                # the same side. FillTracker keeps polling its final trade aggregate.
+                self._taker_pending_until[side] = time.time() + 2.0
                 if self.dry_run:
                     self._dry_fill(oid)
                 self.log.info(
-                    "TAKER repair %s %.0f sh @ %.3f ratio=%s stale=%.1fs basis=%s",
+                    "TAKER FAK %s ~$%.2f max=%.3f planned=%.0fsh ratio=%s opposite_lag=%.1fs projected=%s",
                     side,
+                    notional,
+                    max_price,
                     shares,
-                    price,
                     "inf"
                     if math.isinf(state.larger_to_smaller_ratio)
                     else f"{state.larger_to_smaller_ratio:.3f}",
@@ -313,8 +317,8 @@ class MakerLoop:
         ratio = state.larger_to_smaller_ratio
         held = self.tracker.up.shares if side == "UP" else self.tracker.down.shares
 
-        # Only a true runaway imbalance hard-pauses the heavy side. Normal imbalance
-        # is handled by price/size skew and the taker repair layer.
+        # Normal imbalance is handled by skew + selective aggression. Only an
+        # exceptional runaway imbalance hard-pauses the heavy side.
         if relation == "heavy" and ratio >= self.cfg.hard_pause_ratio:
             await self._cancel_side(side)
             return
@@ -323,10 +327,6 @@ class MakerLoop:
             return
 
         sq = self._sides[side]
-        if sq.order_id and sq.mode == "taker":
-            await self._cancel_side(side)
-            sq = self._sides[side]
-
         price = target
         shares = adaptive_clip(
             base_clip_shares=self.cfg.base_clip_shares,
@@ -339,7 +339,8 @@ class MakerLoop:
             aggressive=False,
         )
 
-        # Shave only as much as aggregate basis requires; no fixed 0.97 pair cap.
+        # Shave only as much as aggregate basis requires. There is no permanent
+        # 0.97 pair invariant in this controller.
         while price >= self._tick and not basis_allows(
             state,
             side=side,
@@ -371,11 +372,9 @@ class MakerLoop:
             await self._cancel_order(sq.order_id)
             self._sides[side] = _SideQuote()
 
-        oid = await self._post_buy(
-            token_id, side, price, shares, post_only=True, mode="maker"
-        )
+        oid = await self._post_maker_buy(token_id, side, price, shares)
         if oid:
-            self._sides[side] = _SideQuote(oid, price, "maker", time.time())
+            self._sides[side] = _SideQuote(oid, price, time.time())
             self.tracker.register(
                 oid, side, token_id, price, shares, mode="maker"
             )
@@ -388,22 +387,12 @@ class MakerLoop:
             )
             self.backoff.success(f"post:{side}")
 
-    async def _post_buy(
-        self,
-        token_id: str,
-        side: str,
-        price: float,
-        shares: float,
-        *,
-        post_only: bool,
-        mode: str,
+    async def _post_maker_buy(
+        self, token_id: str, side: str, price: float, shares: float
     ) -> str | None:
         assert side in ("UP", "DOWN")
         if self.dry_run:
-            return (
-                f"dry_{mode}_{side}_{int(price*1000)}_"
-                f"{int(time.time()*1e6)%1000000}"
-            )
+            return f"dry_maker_{side}_{int(price*1000)}_{int(time.time()*1e6)%1000000}"
         if not self.backoff.ready(f"post:{side}"):
             return None
         try:
@@ -412,13 +401,53 @@ class MakerLoop:
                 side="BUY",
                 price=str(price),
                 size=str(shares),
-                post_only=post_only,
+                post_only=True,
             )
         except Exception as exc:  # noqa: BLE001
             self._order_error(side, str(exc))
             return None
-        if getattr(resp, "ok", False):
-            return str(resp.order_id)
+        oid = str(getattr(resp, "order_id", "") or "")
+        if oid:
+            return oid
+        self._order_error(
+            side, f"{getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
+        )
+        return None
+
+    async def _post_taker_buy(
+        self,
+        *,
+        token_id: str,
+        side: str,
+        max_price: float,
+        planned_shares: float,
+    ) -> str | None:
+        """Place a BUY FAK market order with a hard max price.
+
+        Official py-sdk BUY market orders specify collateral `amount`, not shares.
+        FillTracker therefore treats planned_shares only as a sizing estimate and
+        reconciles actual shares + cost from confirmed trades.
+        """
+        assert side in ("UP", "DOWN")
+        amount = max_price * planned_shares
+        if self.dry_run:
+            return f"dry_taker_{side}_{int(max_price*1000)}_{int(time.time()*1e6)%1000000}"
+        if not self.backoff.ready(f"post:{side}"):
+            return None
+        try:
+            resp = await self.client.place_market_order(
+                token_id=token_id,
+                side="BUY",
+                amount=str(amount),
+                max_price=str(max_price),
+                order_type="FAK",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._order_error(side, str(exc))
+            return None
+        oid = str(getattr(resp, "order_id", "") or "")
+        if oid:
+            return oid
         self._order_error(
             side, f"{getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
         )
@@ -439,14 +468,12 @@ class MakerLoop:
 
     async def _enter_hold(self) -> None:
         self.log.info(
-            "T−%ds HOLD — cancel quotes; settlement is post-close",
+            "T−%ds HOLD — cancel maker quotes; settlement is post-close",
             self.cfg.stop_posting_buffer_s,
         )
         await self._cancel_all_safe()
         if not self.dry_run:
-            filled_notional = await self.tracker.reconcile(self.client)
-            if filled_notional:
-                self.capital.on_spend(self.market.condition_id, filled_notional)
+            await self._reconcile_spend()
 
     async def _fetch_books(self) -> tuple[BookSide, BookSide] | None:
         try:
@@ -471,23 +498,17 @@ class MakerLoop:
         if u is None or d is None:
             return None
         self._tick = float(up_book.tick_size or FALLBACK_TICK)
-        self._min_shares = float(
-            up_book.min_order_size or FALLBACK_MIN_ORDER_SHARES
-        )
+        self._min_shares = float(up_book.min_order_size or FALLBACK_MIN_ORDER_SHARES)
         if self.dry_run:
             self._simulate_maker_fills()
         return u, d
 
     def _simulate_maker_fills(self) -> None:
-        """Deterministic plumbing simulation; not a profitability model."""
+        """Deterministic plumbing simulation only; not a profitability model."""
         self._dry_cycle += 1
         for i, side in enumerate(("UP", "DOWN")):
             sq = self._sides[side]
-            if (
-                sq.order_id
-                and sq.mode == "maker"
-                and (self._dry_cycle + i * 3) % 7 == 0
-            ):
+            if sq.order_id and (self._dry_cycle + i * 3) % 7 == 0:
                 self._dry_fill(sq.order_id)
                 self._sides[side] = _SideQuote()
 
@@ -499,7 +520,9 @@ class MakerLoop:
         if delta <= 0:
             return
         o.filled = o.shares
+        o.filled_cost = o.shares * o.price
         o.open = False
+        o.finalized = True
         tot = self.tracker.up if o.side == "UP" else self.tracker.down
         tot.shares += delta
         tot.cost += delta * o.price
@@ -511,11 +534,7 @@ class MakerLoop:
                 self.market.condition_id, o.order_id, o.side, o.price, delta
             )
         self.log.info(
-            "[dry] FILL %s %.0f sh @ %.3f [%s]",
-            o.side,
-            delta,
-            o.price,
-            o.mode,
+            "[dry] FILL %s %.0f sh @ %.3f [%s]", o.side, delta, o.price, o.mode
         )
 
     async def _cancel_order(self, order_id: str) -> None:
@@ -523,6 +542,7 @@ class MakerLoop:
         if self.dry_run or order_id.startswith("dry_"):
             if o:
                 o.open = False
+                o.finalized = True
             return
         try:
             await self.client.cancel_order(order_id=order_id)
@@ -531,7 +551,7 @@ class MakerLoop:
 
     async def _cancel_side(self, side: str) -> None:
         for oid, o in list(self.tracker.orders.items()):
-            if o.open and o.side == side:
+            if o.open and o.side == side and o.mode == "maker":
                 await self._cancel_order(oid)
         self._sides[side] = _SideQuote()
         self.capital.update_resting(
@@ -541,15 +561,15 @@ class MakerLoop:
     async def _cancel_all_safe(self) -> None:
         if self.dry_run:
             for o in self.tracker.orders.values():
-                o.open = False
+                if o.mode == "maker":
+                    o.open = False
+                    o.finalized = True
             for side in self._sides:
                 self._sides[side] = _SideQuote()
             self.capital.update_resting(self.market.condition_id, 0.0)
             return
         try:
-            await self.client.cancel_market_orders(
-                market=self.market.condition_id
-            )
+            await self.client.cancel_market_orders(market=self.market.condition_id)
         except Exception as exc:  # noqa: BLE001
             self.log.warning("bulk cancel failed (%s); falling back", exc)
             for oid in self.tracker.open_order_ids():
