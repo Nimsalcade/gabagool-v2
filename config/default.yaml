@@ -1,4 +1,4 @@
-# Gabagool v3 — forensic-calibrated policy defaults
+# Gabagool V4 — production forensic-calibrated defaults
 # Credentials remain environment-only.
 
 dry_run: true
@@ -24,13 +24,13 @@ strategy:
     300: 10
     900: 12
 
-  # Clip schedule calibrated to the observed 5-50 share regime.
+  # Clip schedule calibrated to the observed 5-50 share regime; 10-20 dominates.
   base_clip_shares: 10
   max_clip_shares: 40
   max_shares_per_side: 2500
   hard_pause_ratio: 5.0
 
-  # Taker fills historically persist into the last seconds at reduced frequency.
+  # Taker is deficient-leg repair only and fades sharply near expiry.
   taker_enabled: true
   taker_stop_buffer_s: 2
 
@@ -39,7 +39,9 @@ strategy:
   settlement_sweep_interval_s: 10
   min_pairs_to_merge: 1
 
-  assets: [btc, eth, sol, xrp]
+  # Strongest reconstructed reference universe. SOL/XRP remain supported by code
+  # but are opt-in rather than silently expanding the strategy beyond the core sample.
+  assets: [btc, eth]
   durations: [300, 900]
 
 capital:
