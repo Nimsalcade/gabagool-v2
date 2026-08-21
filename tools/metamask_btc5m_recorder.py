@@ -127,7 +127,7 @@ def _best_from_book(levels: list[dict[str, Any]] | None, *, is_bid: bool):
         parsed.append((price, size))
     if not parsed:
         return None, None
-    return (max(parsed) if is_bid else min(parsed), key=lambda x: x[0])
+    return max(parsed, key=lambda x: x[0]) if is_bid else min(parsed, key=lambda x: x[0])
 
 
 def _iso_ms(ts_ms: int) -> str:
@@ -265,7 +265,7 @@ class Recorder:
             "down_bid": self.down.bid if self.down.bid is not None else "",
             "down_bid_size": self.down.bid_size if self.down.bid_size is not None else "",
             "down_ask": self.down.ask if self.down.ask is not None else "",
-            "down_ask_size": self.down.ask_size if self.down.ask_size is not None else "",
+            "down_ask_size": self.down.ask_size if self.down_ask_size is not None else "",
             "instant_pair_ask": instant if instant is not None else "",
             "instant_pair_gross_edge": instant_edge if instant_edge is not None else "",
             "maker_pair_bid": maker_pair if maker_pair is not None else "",
@@ -442,7 +442,6 @@ async def _resolve_target(client, use_next: bool):
         while True:
             market = await resolve_market(client, ASSET, DURATION_S, target_start)
             if market is not None:
-                # Connect just before opening if the market is already published.
                 wait = target_start - time.time() - 1.0
                 if wait > 0:
                     await asyncio.sleep(wait)
