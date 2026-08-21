@@ -1,10 +1,10 @@
-"""
-Pre-flight verification. Run before every live session:
+"""Production pre-flight verification.
 
     python -m tools.check_setup
 
-Checks, in order: config shape -> wallet binding -> relayer auth -> approvals ->
-pUSD balance -> live market data -> merge proof freshness.
+Checks config -> wallet binding -> relayer/approvals -> pUSD -> market data ->
+wallet-matched fresh merge proof. This tool is read-only except for idempotent approval
+setup; live startup itself performs order/position recovery.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from src.inventory import fetch_pusd_balance  # noqa: E402
 from src.sdk import build_secure_client, ensure_trading_approvals  # noqa: E402
 
 OK, BAD = "  PASS ", "  FAIL "
+PROOF_MAX_AGE_H = 7 * 24
 
 
 async def main() -> int:
@@ -60,7 +61,7 @@ async def main() -> int:
 
         bal = await fetch_pusd_balance(client)
         report(
-            bal >= cfg.capital.min_starting_pusd,
+            bal == bal and bal >= cfg.capital.min_starting_pusd,
             "pUSD balance",
             f"${bal:.2f} (floor ${cfg.capital.min_starting_pusd:.2f})",
         )
@@ -73,7 +74,7 @@ async def main() -> int:
             report(
                 bool(markets),
                 "market discovery",
-                f"{len(markets)} current 5m/15m markets found, {len(live)} accepting orders",
+                f"{len(markets)} configured current markets found, {len(live)} accepting orders",
             )
             if live:
                 book = await client.get_order_book(token_id=live[0].up_token_id)
@@ -91,16 +92,16 @@ async def main() -> int:
                 data = json.loads(proof.read_text())
                 age_h = (time.time() - float(data.get("ts", 0))) / 3600
                 same_wallet = str(data.get("wallet", "")).lower() == bc.wallet.lower()
+                has_tx = bool(str(data.get("merge_tx", "") or ""))
+                fresh = 0 <= age_h <= PROOF_MAX_AGE_H
                 report(
-                    same_wallet,
+                    same_wallet and fresh and has_tx,
                     "merge proof",
-                    f"{age_h:.1f}h old, tx={str(data.get('merge_tx'))[:18]}…"
-                    + ("" if same_wallet else " (DIFFERENT WALLET — rerun test_merge)"),
+                    f"{age_h:.1f}h old, wallet={'match' if same_wallet else 'MISMATCH'}, "
+                    f"tx={'present' if has_tx else 'missing'}",
                 )
-                if age_h > 72:
-                    print("         note: proof older than 72h — consider re-running test_merge")
-            except Exception:  # noqa: BLE001
-                report(False, "merge proof", "unreadable — rerun tools.test_merge")
+            except Exception as exc:  # noqa: BLE001
+                report(False, "merge proof", f"unreadable ({exc}) — rerun tools.test_merge")
         else:
             report(False, "merge proof", "missing — run `python -m tools.test_merge`")
     finally:
