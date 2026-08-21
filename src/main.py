@@ -1,18 +1,21 @@
-"""Entry point for the forensic-calibrated Gabagool replica.
+"""Production entry point for the forensic-calibrated Gabagool engine.
 
     python -m src.main --dry-run
     python -m src.main --live
 
-Live mode still requires a fresh, real split->merge proof. Strategy reconstruction never
-weakens the operational safety gate.
+Live mode is deliberately strict: credentials must bind the expected wallet, a recent
+wallet-matched split/merge proof must exist, stale orders are cancelled, real positions
+are recovered, and only then does the scheduler start.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 
 from .capital import CapitalManager, KillSwitch
@@ -20,10 +23,12 @@ from .config import BotConfig, ConfigError
 from .inventory import fetch_pusd_balance
 from .ledger import Ledger
 from .ops import Heartbeat
+from .recovery import recover_wallet_state
 from .sdk import build_secure_client, ensure_trading_approvals
 from .window_manager import WindowManager
 
 MERGE_PROOF = Path(".merge_proof")
+MERGE_PROOF_MAX_AGE_S = 7 * 24 * 3600
 
 
 def _setup_logging(level: str) -> None:
@@ -53,6 +58,8 @@ class _ColoredFormatter(logging.Formatter):
             color = self.BOLD + (self.GREEN if "MERGED" in msg else self.RED if "FAIL" in msg else self.RESET)
         elif record.name == "fills":
             color = self.CYAN
+        elif record.name == "recovery":
+            color = self.YELLOW
         elif record.name.startswith("maker."):
             if "window start" in msg or "window done" in msg:
                 color = self.BOLD + self.BLUE
@@ -75,6 +82,32 @@ class _ColoredFormatter(logging.Formatter):
         return f"{self.GREY}{time_str}{self.RESET} {color}{msg}{self.RESET}"
 
 
+def _require_wallet_merge_proof(wallet: str) -> None:
+    if not MERGE_PROOF.exists():
+        raise ConfigError(
+            "no .merge_proof found; run `python -m tools.test_merge` with this wallet first"
+        )
+    try:
+        data = json.loads(MERGE_PROOF.read_text())
+        proof_wallet = str(data.get("wallet", ""))
+        ts = float(data.get("ts", 0))
+        tx = str(data.get("merge_tx", ""))
+    except Exception as exc:  # noqa: BLE001
+        raise ConfigError(f"invalid .merge_proof: {exc}") from exc
+    if proof_wallet.lower() != wallet.lower():
+        raise ConfigError(
+            f".merge_proof belongs to {proof_wallet or 'unknown wallet'}, but SDK bound {wallet}"
+        )
+    age = time.time() - ts
+    if ts <= 0 or age < 0 or age > MERGE_PROOF_MAX_AGE_S:
+        raise ConfigError(
+            f".merge_proof is stale ({age/86400:.1f} days); rerun `python -m tools.test_merge`"
+        )
+    if not tx:
+        raise ConfigError(".merge_proof has no merge transaction hash")
+    logging.info("merge proof accepted | wallet=%s age=%.1fh tx=%s", wallet, age / 3600, tx)
+
+
 async def amain(cfg: BotConfig) -> int:
     ledger = Ledger(cfg.db_path)
     capital = CapitalManager(cfg.capital, ledger=ledger)
@@ -84,17 +117,46 @@ async def amain(cfg: BotConfig) -> int:
     heartbeat: Heartbeat | None = None
 
     try:
+        wm = WindowManager(client, cfg=cfg, capital=capital, ledger=ledger)
+
         if not cfg.dry_run:
+            _require_wallet_merge_proof(bc.wallet)
             await ensure_trading_approvals(bc)
+
+            # Production restart reconciliation: cancel anything this process does
+            # not own, then reconstruct wallet positions before making a new order.
+            recovery = await recover_wallet_state(client)
+
             bal = await fetch_pusd_balance(client)
-            logging.info("wallet %s | pUSD $%.2f", bc.wallet, bal)
-            if bal < cfg.capital.min_starting_pusd:
-                logging.error(
-                    "pUSD balance $%.2f below min_starting_pusd $%.2f — fund or adjust floor",
-                    bal,
-                    cfg.capital.min_starting_pusd,
-                )
+            logging.info(
+                "wallet %s | pUSD $%.2f | recovered committed $%.2f",
+                bc.wallet,
+                bal,
+                recovery.committed_cost,
+            )
+            if bal != bal:
+                logging.error("cannot determine pUSD balance — refusing live startup")
                 return 2
+
+            # If cash is below the configured trading floor but inventory exists,
+            # preserve the process as settlement-only rather than abandoning state.
+            if bal < cfg.capital.min_starting_pusd:
+                if not (recovery.active or recovery.settlement_due):
+                    logging.error(
+                        "pUSD balance $%.2f below min_starting_pusd $%.2f",
+                        bal,
+                        cfg.capital.min_starting_pusd,
+                    )
+                    return 2
+                logging.warning(
+                    "cash below trading floor; entering SETTLEMENT-ONLY mode for recovered inventory"
+                )
+                for cid, seed in list(recovery.active.items()):
+                    recovery.settlement_due[cid] = seed
+                    recovery.active.pop(cid, None)
+                cfg.capital.max_concurrent_windows = 0
+
+            wm.apply_recovery(recovery)
             ledger.record_balance(bal)
             if cfg.heartbeat:
                 heartbeat = Heartbeat(
@@ -105,11 +167,13 @@ async def amain(cfg: BotConfig) -> int:
                 )
                 await heartbeat.start()
 
-        wm = WindowManager(client, cfg=cfg, capital=capital, ledger=ledger)
         await wm.run_forever()
         return 0
     except KillSwitch:
         return 3
+    except RuntimeError as exc:
+        logging.getLogger("main").critical("startup/runtime safety failure: %s", exc)
+        return 4
     finally:
         if heartbeat is not None:
             await heartbeat.stop()
@@ -134,17 +198,12 @@ async def _public_ish_client(cfg: BotConfig):
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Gabagool V3 — forensic-calibrated complete-set accumulation engine"
+        description="Gabagool V4 — production complete-set accumulation engine"
     )
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
     ap.add_argument("--config", default="config/default.yaml")
-    ap.add_argument(
-        "--i-understand-no-merge-proof",
-        action="store_true",
-        help="bypass merge-proof gate (not recommended)",
-    )
     args = ap.parse_args()
 
     try:
@@ -161,13 +220,6 @@ def main() -> None:
             cfg.validate()
         except ConfigError as exc:
             print(f"CONFIG ERROR: {exc}", file=sys.stderr)
-            sys.exit(2)
-        if not MERGE_PROOF.exists() and not args.i_understand_no_merge_proof:
-            print(
-                "REFUSING LIVE MODE: no .merge_proof found.\n"
-                "Run `python -m tools.test_merge` first.",
-                file=sys.stderr,
-            )
             sys.exit(2)
 
     loop = asyncio.new_event_loop()
