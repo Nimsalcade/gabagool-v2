@@ -19,14 +19,44 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+from polymarket.errors import TransportError as PolymarketTransportError
 
 from tools import metamask_10market_run as run
+from tools import metamask_tiny_live_test as live
 from tools import metamask_tiny_order as tiny
 
 # Six-decimal sentinel representing strict < $1 for the current controller's <= check.
 # Market tick sizes normally make the executable ceiling lower than this naturally.
 PAIR_MAX = Decimal("0.999999")
 WINDOW_SPEND_CAP = Decimal("5.00")
+
+# Keep the original function before main() installs the retrying wrapper.
+_ORIGINAL_BOOKS = live._books  # pyright: ignore[reportPrivateUsage]
+
+
+async def _resilient_books(client: Any, up: str, down: str) -> tuple[Any, Any]:
+    """Retry transient read-only order-book failures inside the same 5-minute market.
+
+    Book reads are idempotent, unlike order submissions, so they are safe to retry.
+    A short transport outage should not consume an entire validation session.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(1, 6):
+        try:
+            return await _ORIGINAL_BOOKS(client, up, down)
+        except (PolymarketTransportError, httpx.TransportError) as exc:
+            last_error = exc
+            if attempt == 5:
+                break
+            delay = min(1.0, 0.15 * (2 ** (attempt - 1)))
+            print(
+                f"NET       BOOKS transient {type(exc).__name__}; "
+                f"retry {attempt}/5 in {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(
+        "order-book transport unavailable after 5 retries; ending only this session"
+    ) from last_error
 
 
 async def _cancel_after_ambiguous_submit(client: Any, label: str) -> None:
@@ -93,7 +123,7 @@ async def _exact_share_buy(
             side="BUY",
             post_only=False,
         )
-    except httpx.TransportError as exc:
+    except (PolymarketTransportError, httpx.TransportError) as exc:
         # Do not blindly resubmit. The exchange may have accepted the order even
         # though the HTTP response was lost. Cancel any possible remainder, then
         # let the caller reconcile the real position/cash delta.
@@ -114,7 +144,7 @@ async def _exact_share_buy(
     if order_id:
         try:
             await client.cancel_order(order_id=order_id)
-        except httpx.TransportError as exc:
+        except (PolymarketTransportError, httpx.TransportError) as exc:
             print(f"NET       {label} cancel {type(exc).__name__}: reconciling with cancel-all")
             await _cancel_after_ambiguous_submit(client, label)
         except Exception:  # noqa: BLE001
@@ -127,6 +157,7 @@ async def _exact_share_buy(
 
 def main() -> None:
     tiny._safe_buy = _exact_share_buy  # type: ignore[method-assign]
+    live._books = _resilient_books  # type: ignore[method-assign]
 
     # Override the base experiment's old arbitrary pair threshold. For this phase,
     # accept any projected matched pair strictly below $1 and let the exchange tick
@@ -146,6 +177,10 @@ def main() -> None:
     print(
         "RECOVERY  ambiguous network submits are never blindly retried; possible "
         "resting orders are cancelled and actual holdings are reconciled first"
+    )
+    print(
+        "NETWORK   transient read-only book failures retry inside the same market; "
+        "they no longer waste a whole 5-minute session"
     )
     print(
         "GOAL      confirm repeated sub-$1 two-leg acquisition + matched-share MERGE; "
