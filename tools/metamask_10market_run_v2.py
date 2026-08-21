@@ -30,33 +30,46 @@ from tools import metamask_tiny_order as tiny
 PAIR_MAX = Decimal("0.999999")
 WINDOW_SPEND_CAP = Decimal("5.00")
 
-# Keep the original function before main() installs the retrying wrapper.
+# Preserve originals before main() installs retrying read wrappers.
 _ORIGINAL_BOOKS = live._books  # pyright: ignore[reportPrivateUsage]
+_ORIGINAL_POSITIONS = live._positions  # pyright: ignore[reportPrivateUsage]
+_ORIGINAL_PUSD_BALANCE = live._pusd_balance  # pyright: ignore[reportPrivateUsage]
+
+
+async def _read_retry(label: str, call: Any, *args: Any) -> Any:
+    """Retry idempotent network reads without turning a brief outage into exposure."""
+    last_error: BaseException | None = None
+    for attempt in range(1, 8):
+        try:
+            return await call(*args)
+        except (PolymarketTransportError, httpx.TransportError) as exc:
+            last_error = exc
+            if attempt == 7:
+                break
+            delay = min(1.25, 0.15 * (2 ** (attempt - 1)))
+            print(
+                f"NET       {label} transient {type(exc).__name__}; "
+                f"retry {attempt}/7 in {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"{label} unavailable after 7 retries") from last_error
 
 
 async def _resilient_books(client: Any, up: str, down: str) -> tuple[Any, Any]:
-    """Retry transient read-only order-book failures inside the same 5-minute market.
+    return await _read_retry("BOOKS", _ORIGINAL_BOOKS, client, up, down)
 
-    Book reads are idempotent, unlike order submissions, so they are safe to retry.
-    A short transport outage should not consume an entire validation session.
-    """
-    last_error: BaseException | None = None
-    for attempt in range(1, 6):
-        try:
-            return await _ORIGINAL_BOOKS(client, up, down)
-        except (PolymarketTransportError, httpx.TransportError) as exc:
-            last_error = exc
-            if attempt == 5:
-                break
-            delay = min(1.0, 0.15 * (2 ** (attempt - 1)))
-            print(
-                f"NET       BOOKS transient {type(exc).__name__}; "
-                f"retry {attempt}/5 in {delay:.2f}s"
-            )
-            await asyncio.sleep(delay)
-    raise RuntimeError(
-        "order-book transport unavailable after 5 retries; ending only this session"
-    ) from last_error
+
+async def _resilient_positions(
+    ctf: str,
+    wallet: str,
+    up: str,
+    down: str,
+) -> tuple[Decimal, Decimal]:
+    return await _read_retry("POSITIONS", _ORIGINAL_POSITIONS, ctf, wallet, up, down)
+
+
+async def _resilient_pusd_balance(token: str, wallet: str) -> Decimal:
+    return await _read_retry("CASH", _ORIGINAL_PUSD_BALANCE, token, wallet)
 
 
 async def _cancel_after_ambiguous_submit(client: Any, label: str) -> None:
@@ -158,6 +171,8 @@ async def _exact_share_buy(
 def main() -> None:
     tiny._safe_buy = _exact_share_buy  # type: ignore[method-assign]
     live._books = _resilient_books  # type: ignore[method-assign]
+    live._positions = _resilient_positions  # type: ignore[method-assign]
+    live._pusd_balance = _resilient_pusd_balance  # type: ignore[method-assign]
 
     # Override the base experiment's old arbitrary pair threshold. For this phase,
     # accept any projected matched pair strictly below $1 and let the exchange tick
@@ -179,8 +194,8 @@ def main() -> None:
         "resting orders are cancelled and actual holdings are reconciled first"
     )
     print(
-        "NETWORK   transient read-only book failures retry inside the same market; "
-        "they no longer waste a whole 5-minute session"
+        "NETWORK   book, position, and pUSD reads retry inside the same market so a "
+        "transient timeout after LEG1 does not abandon the hedge loop"
     )
     print(
         "GOAL      confirm repeated sub-$1 two-leg acquisition + matched-share MERGE; "
