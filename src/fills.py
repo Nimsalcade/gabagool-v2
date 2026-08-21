@@ -1,11 +1,13 @@
-"""Authoritative fill tracking with exact taker trade-cost reconciliation.
+"""Authoritative fill tracking with delayed finalization for maker and taker orders.
 
 Rules:
 - an order disappearing from open orders is never inferred as a fill;
-- maker fills use exchange `size_matched` while open, then confirmed trade attribution;
-- FAK taker orders are re-checked against the trades API for a short finalization window;
+- open maker fills use exchange `size_matched` immediately;
+- once a maker order disappears/cancels, confirmed account trades remain authoritative
+  for a finalization grace period so indexing lag cannot erase the last fill;
+- FAK taker orders use the same delayed trade-index finalization principle;
 - taker cost uses actual trade price, not the planning max-price;
-- maker/taker execution-event counts increment only when authoritative filled quantity grows.
+- cancelled/unfilled orders contribute zero inventory.
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("fills")
 _COUNTABLE = {"MATCHED", "MINED", "CONFIRMED"}
-_TAKER_FINALIZE_S = 30.0
+_FINALIZE_S = 30.0
 
 
 @dataclass
@@ -30,6 +32,7 @@ class TrackedOrder:
     filled_cost: float = 0.0
     open: bool = True
     created_ts: float = field(default_factory=time.time)
+    closed_ts: float | None = None
     finalized: bool = False
 
 
@@ -83,6 +86,15 @@ class FillTracker:
             order_id, side, token_id, price, shares, mode=mode
         )
 
+    def mark_closed(self, order_id: str, *, when: float | None = None) -> None:
+        """Mark an order as no longer resting without finalizing its fill total."""
+        o = self.orders.get(order_id)
+        if o is None:
+            return
+        o.open = False
+        if o.closed_ts is None:
+            o.closed_ts = time.time() if when is None else float(when)
+
     def resting_price(self, side: str) -> float | None:
         prices = [
             o.price for o in self.orders.values()
@@ -94,6 +106,13 @@ class FillTracker:
         return sum(
             o.price * max(0.0, o.shares - o.filled)
             for o in self.orders.values() if o.open and o.mode == "maker"
+        )
+
+    def resting_notional_excluding_side(self, side: str) -> float:
+        return sum(
+            o.price * max(0.0, o.shares - o.filled)
+            for o in self.orders.values()
+            if o.open and o.mode == "maker" and o.side != side
         )
 
     def open_order_ids(self) -> list[str]:
@@ -117,38 +136,54 @@ class FillTracker:
             log.debug("open-orders poll failed (%s); keeping prior state", exc)
             return 0.0
 
+        # First transition maker orders that are no longer visible into a closed-but-
+        # unfinalized state. This releases resting capital immediately while retaining
+        # a grace window for lagging trade-index rows.
+        for o in self.orders.values():
+            if o.mode == "maker" and o.open and o.order_id not in open_ids:
+                self.mark_closed(o.order_id, when=now)
+            elif o.mode == "taker" and o.open:
+                # FAK never rests after the request returns.
+                self.mark_closed(o.order_id, when=now)
+
         needs_trades = any(
-            (o.open and o.order_id not in open_ids)
-            or (o.mode == "taker" and not o.finalized and now - o.created_ts <= _TAKER_FINALIZE_S)
+            not o.finalized
+            and (
+                o.mode == "taker"
+                or not o.open
+            )
             for o in self.orders.values()
         )
         traded = await self._fills_from_trades(client) if needs_trades else {}
 
         new_notional = 0.0
         for o in self.orders.values():
-            if o.mode == "taker":
-                agg = traded.get(o.order_id)
-                if agg is not None:
-                    new_notional += self._apply_target(o, agg.shares, agg.cost)
-                o.open = False
-                if now - o.created_ts > _TAKER_FINALIZE_S:
-                    o.finalized = True
+            if o.finalized:
                 continue
 
-            if not o.open:
-                continue
-            if o.order_id in open_ids:
+            if o.mode == "maker" and o.open and o.order_id in open_ids:
                 target_shares = min(open_matched.get(o.order_id, o.filled), o.shares)
                 target_cost = target_shares * o.price
-            else:
-                agg = traded.get(o.order_id)
-                target_shares = min(agg.shares if agg is not None else o.filled, o.shares)
-                target_cost = target_shares * o.price
-                o.open = False
+                new_notional += self._apply_target(o, target_shares, target_cost)
+                continue
+
+            # Closed maker or FAK taker: authoritative trades can continue to appear
+            # after the order is no longer visible. Never infer a fill from absence.
+            agg = traded.get(o.order_id)
+            if agg is not None:
+                target_shares = agg.shares
+                if o.mode == "maker":
+                    target_shares = min(target_shares, o.shares)
+                    target_cost = target_shares * o.price
+                else:
+                    target_cost = agg.cost
+                new_notional += self._apply_target(o, target_shares, target_cost)
+
+            closed_anchor = o.closed_ts if o.closed_ts is not None else o.created_ts
+            if now - closed_anchor > _FINALIZE_S:
                 o.finalized = True
-                if target_shares == 0 and o.filled == 0:
-                    log.debug("order %s cancelled/unfilled", o.order_id[:10])
-            new_notional += self._apply_target(o, target_shares, target_cost)
+                if o.filled <= 1e-9:
+                    log.debug("order %s finalized cancelled/unfilled", o.order_id[:10])
 
         return new_notional
 
