@@ -6,10 +6,10 @@ same 10-market strategy but replaces BUY execution with a crossing limit order s
 in shares, then cancels any unfilled remainder quickly. This preserves the intended
 ~5-share first leg and exact deficient-share hedge without forcing a $1 minimum BUY.
 
-The complete-set rule is adaptive: the second leg is allowed whenever the combined
-pair basis is below $1, with a one-cent reserve. PAIR_MAX=0.99 means the second-leg
-ceiling is 0.99 minus the measured first-leg unit cost; it is not a fixed second-leg
-price target.
+This experiment is a plumbing/logic validation, not an optimized economic policy. The
+only pair-selection invariant is that the projected matched complete-set acquisition
+basis must remain strictly below $1. Profit buffers, fee reserves, maker/taker policy,
+and optimal entry thresholds are intentionally left for later tuning.
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ from typing import Any
 from tools import metamask_10market_run as run
 from tools import metamask_tiny_order as tiny
 
-PAIR_MAX = Decimal("0.99")
+# Six-decimal sentinel representing strict < $1 for the current controller's <= check.
+# Market tick sizes normally make the executable ceiling lower than this naturally.
+PAIR_MAX = Decimal("0.999999")
 WINDOW_SPEND_CAP = Decimal("5.00")
 
 
@@ -78,9 +80,9 @@ async def _exact_share_buy(
 def main() -> None:
     tiny._safe_buy = _exact_share_buy  # type: ignore[method-assign]
 
-    # Override the base 10-market experiment's old arbitrary 0.90 threshold.
-    # For five matched shares, 0.99 requires at most $4.95 of gross acquisition
-    # notional, so a $5.00 per-window cap is sufficient for the tiny test.
+    # Override the base experiment's old arbitrary pair threshold. For this phase,
+    # accept any projected matched pair strictly below $1 and let the exchange tick
+    # size determine the nearest executable price. Five matched shares require < $5.
     run.PAIR_MAX = PAIR_MAX
     run.MAX_TOTAL_SPEND = WINDOW_SPEND_CAP
     run.MIN_CASH_TO_START_WINDOW = WINDOW_SPEND_CAP
@@ -90,8 +92,12 @@ def main() -> None:
         "unfilled remainder auto-cancelled"
     )
     print(
-        "PAIR RULE adaptive second leg: combined pair<=0.99; "
-        "LEG2 ceiling = 0.99 - LEG1 unit cost"
+        "PAIR RULE validation mode: projected matched basis must be <1.000000; "
+        "LEG2 ceiling = 1.000000 - LEG1 unit cost (subject to executable tick)"
+    )
+    print(
+        "GOAL      confirm repeated sub-$1 two-leg acquisition + matched-share MERGE; "
+        "economic buffers/tuning come later"
     )
     run.main()
 
