@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal, ROUND_DOWN
+from types import SimpleNamespace
 from typing import Any
+
+import httpx
 
 from tools import metamask_10market_run as run
 from tools import metamask_tiny_order as tiny
@@ -24,6 +27,38 @@ from tools import metamask_tiny_order as tiny
 # Market tick sizes normally make the executable ceiling lower than this naturally.
 PAIR_MAX = Decimal("0.999999")
 WINDOW_SPEND_CAP = Decimal("5.00")
+
+
+async def _cancel_after_ambiguous_submit(client: Any, label: str) -> None:
+    """Fail closed after an ambiguous POST by cancelling every open test order.
+
+    A transport exception can occur before the request reaches the exchange or after
+    the exchange accepted it but before the response reached us. Blindly retrying the
+    BUY could therefore double the intended position. This runner never intentionally
+    leaves resting orders, so cancel_all() is the safest reconciliation action here.
+    Filled shares are not undone; the outer trade loop detects them from on-chain
+    position/cash deltas after this function returns.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(1, 4):
+        try:
+            await asyncio.sleep(0.20 * attempt)
+            await client.cancel_all()
+            print(
+                f"RECOVER   {label} transport result was ambiguous; open orders cancelled, "
+                "reconciling actual position before any retry"
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            print(
+                f"RECOVER   {label} cancel-all attempt {attempt}/3 failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    raise RuntimeError(
+        f"{label}: ambiguous order submission and unable to confirm cancellation; "
+        "refusing another order until exposure is reconciled"
+    ) from last_error
 
 
 async def _exact_share_buy(
@@ -50,13 +85,21 @@ async def _exact_share_buy(
         f"{label}  LIMIT-BUY size={size:.6f} price_cap={max_price:.6f} "
         f"notional_cap=${amount:.6f}"
     )
-    response = await client.place_limit_order(
-        token_id=token_id,
-        price=str(max_price),
-        size=str(size),
-        side="BUY",
-        post_only=False,
-    )
+    try:
+        response = await client.place_limit_order(
+            token_id=token_id,
+            price=str(max_price),
+            size=str(size),
+            side="BUY",
+            post_only=False,
+        )
+    except httpx.TransportError as exc:
+        # Do not blindly resubmit. The exchange may have accepted the order even
+        # though the HTTP response was lost. Cancel any possible remainder, then
+        # let the caller reconcile the real position/cash delta.
+        print(f"NET       {label} {type(exc).__name__}: response unknown")
+        await _cancel_after_ambiguous_submit(client, label)
+        return SimpleNamespace(ok=True, order_id="", status="transport-reconciled")
 
     if not bool(getattr(response, "ok", False)):
         code = getattr(response, "code", "unknown")
@@ -71,7 +114,12 @@ async def _exact_share_buy(
     if order_id:
         try:
             await client.cancel_order(order_id=order_id)
+        except httpx.TransportError as exc:
+            print(f"NET       {label} cancel {type(exc).__name__}: reconciling with cancel-all")
+            await _cancel_after_ambiguous_submit(client, label)
         except Exception:  # noqa: BLE001
+            # The order may already be fully filled/cancelled. The outer loop checks
+            # actual holdings, so a normal terminal-order cancel rejection is benign.
             pass
 
     return response
@@ -94,6 +142,10 @@ def main() -> None:
     print(
         "PAIR RULE validation mode: projected matched basis must be <1.000000; "
         "LEG2 ceiling = 1.000000 - LEG1 unit cost (subject to executable tick)"
+    )
+    print(
+        "RECOVERY  ambiguous network submits are never blindly retried; possible "
+        "resting orders are cancelled and actual holdings are reconciled first"
     )
     print(
         "GOAL      confirm repeated sub-$1 two-leg acquisition + matched-share MERGE; "
