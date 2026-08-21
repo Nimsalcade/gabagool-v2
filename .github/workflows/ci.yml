@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - rebuild/forensic-policy-v3
+      - rebuild/forensic-policy-v4
 
 jobs:
   test:
