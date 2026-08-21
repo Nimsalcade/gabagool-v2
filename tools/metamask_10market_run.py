@@ -68,8 +68,8 @@ async def amain(owner: str) -> int:
         initial_cash = await live._pusd_balance(collateral, wallet)  # pyright: ignore[reportPrivateUsage]
         print(f"START     pUSD=${initial_cash:.6f}")
         print(
-            "LIMITS    10 markets | trigger<=0.25 | LEG1-hard<=0.27 | "
-            "pair<=0.90 | spend<=4.75/window | target=5sh"
+            f"LIMITS    {MARKET_COUNT} markets | trigger<={FIRST_MAX} | "
+            f"pair<={PAIR_MAX} | spend<={MAX_TOTAL_SPEND}/window | target={TEST_SHARES}sh"
         )
         print(
             "MODE      continue after no-trade, flatten, merge, or unmatched LEG1; "
@@ -89,14 +89,12 @@ async def amain(owner: str) -> int:
             target = start + index * 300
             wait = target - time.time()
             if wait > 0:
-                print(
-                    f"WAIT      market {session_no}/{MARKET_COUNT} starts in {wait:.1f}s"
-                )
+                print(f"WAIT      market {session_no}/{MARKET_COUNT} starts in {wait:.1f}s")
                 await asyncio.sleep(wait)
 
             market = await live._resolve_fresh_market(client, target)  # pyright: ignore[reportPrivateUsage]
             if market is None:
-                print(f"SESSION   {session_no}/10 market unavailable start={target}")
+                print(f"SESSION   {session_no}/{MARKET_COUNT} market unavailable start={target}")
                 rows.append(
                     {
                         "n": session_no,
@@ -162,7 +160,7 @@ async def amain(owner: str) -> int:
             delta = cash_after - cash_before
 
             print(
-                f"SESSION   {session_no}/10 status={status} "
+                f"SESSION   {session_no}/{MARKET_COUNT} status={status} "
                 f"cash=${cash_before:.6f}->${cash_after:.6f} delta=${delta:+.6f} "
                 f"residual UP={up_bal:.6f} DOWN={down_bal:.6f}"
             )
@@ -190,7 +188,7 @@ async def amain(owner: str) -> int:
         counts = Counter(str(row["status"]) for row in rows)
 
         print("\n" + "=" * 72)
-        print("10-MARKET PERFORMANCE SUMMARY")
+        print(f"{MARKET_COUNT}-MARKET PERFORMANCE SUMMARY")
         print(f"START CASH ${initial_cash:.6f}")
         print(f"END CASH   ${final_cash:.6f}")
         print(f"CASH DELTA ${final_cash - initial_cash:+.6f}")
@@ -222,7 +220,7 @@ async def amain(owner: str) -> int:
             print(
                 "NOTE       cash delta is not final P&L while unresolved residual positions "
                 "remain. Their eventual settlement/redemption value must be added before "
-                "judging the 10-market strategy result."
+                f"judging the {MARKET_COUNT}-market strategy result."
             )
         else:
             print("NOTE       no residual market positions remain in the recorded sessions.")
