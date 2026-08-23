@@ -1,0 +1,75 @@
+{
+  "name": "gabagool22_15m_reconstruction_v1",
+  "scope": {
+    "assets": ["BTC", "ETH"],
+    "market_type": "updown",
+    "duration_seconds": 900,
+    "fit_day": "2025-10-29",
+    "fit_markets": 150,
+    "fit_fills": 16050
+  },
+  "lifecycle": {
+    "trade_sides": ["BUY"],
+    "sell_observed_in_fit_sample": false,
+    "merge_complete_sets": true,
+    "redeem_residual_winner": true
+  },
+  "quote": {
+    "order_type": "GTC_LIMIT_BUY",
+    "price_grid": "integer_cent",
+    "base_bid_up_formula": "100 - displayed_down_ask_cents",
+    "base_bid_down_formula": "100 - displayed_up_ask_cents",
+    "hard_pair_cap_cents": null,
+    "comment": "Use the complementary outcome ask to infer the passive best bid; do not force a universal 99c cap."
+  },
+  "timing": {
+    "quote_start_age_seconds": 18,
+    "quote_end_age_seconds": 899,
+    "clip_schedule": [
+      {"from_age": 18, "to_age": 212, "shares": 10},
+      {"from_age": 212, "to_age": 382, "shares": 9},
+      {"from_age": 382, "to_age": 522, "shares": 8},
+      {"from_age": 522, "to_age": 664, "shares": 7},
+      {"from_age": 664, "to_age": 818, "shares": 6},
+      {"from_age": 818, "to_age": 899, "shares": 5}
+    ]
+  },
+  "inventory_controller": {
+    "state_variable": "gap_clips = abs(up_inventory - down_inventory) / current_clip_shares",
+    "empirical_repair_logit": "logit(P(next timestamp net flow repairs imbalance)) = -0.06516 + 0.39125 * gap_clips",
+    "control_mode": "reduce_overweight_quote_exposure_not_parent_clip_size",
+    "underweight_exposure_layers": 4,
+    "overweight_layer_targets": [
+      {"gap_clips_lt": 0.5, "layers": 4},
+      {"gap_clips_lt": 1.5, "layers": 3},
+      {"gap_clips_lt": 2.5, "layers": 2},
+      {"gap_clips_lt": 3.5, "layers": 1},
+      {"gap_clips_gte": 3.5, "layers": 0}
+    ],
+    "existing_orders": "do_not_assume_immediate_mass_cancel; stale live layers may still fill and create soft overshoot",
+    "hard_safety_gap_clips": 8.0
+  },
+  "fills": {
+    "parent_order_size": "current clip schedule value",
+    "partial_fills_allowed": true,
+    "same_timestamp_rows_are_not_deduplicated": true,
+    "maker_fill_validation": "live paper requires actual CLOB best-bid/depth/trade feed; DOM cross-through is only a conservative proxy"
+  },
+  "complete_sets": {
+    "matched_shares": "min(up_inventory, down_inventory)",
+    "merge_policy": "batch asynchronously; do not merge every newly matched clip",
+    "merge_effect_on_gap": "none",
+    "terminal_policy": "redeem resolved winning residual"
+  },
+  "fit_diagnostics": {
+    "price_exact_cent_fraction": 0.92891,
+    "price_within_0_001_cent_fraction": 0.996199,
+    "row_full_parent_clip_fraction": 0.751713,
+    "median_market_max_abs_gap_shares": 48.522438,
+    "median_final_abs_gap_shares": 11.0685965,
+    "median_final_buy_pair_vwap": 0.9620564873,
+    "median_first_fill_age_seconds": 23,
+    "median_last_fill_age_seconds": 724
+  },
+  "identifiability_note": "This is the maximum-identifiable behavioral reconstruction from public executions. Historical cancelled/unfilled orders, exact queue position, and per-order private lifecycle are not contained in public fill history."
+}
