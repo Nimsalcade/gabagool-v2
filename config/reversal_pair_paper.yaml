@@ -1,0 +1,31 @@
+# BTC 5-minute reversal complete-set — real-book paper mode
+paper_reversal_pair:
+  asset: btc
+  duration_s: 300
+
+  # Read the public books once per second.
+  poll_interval_s: 1.0
+  status_interval_s: 15.0
+
+  # Reversal gate: one side first proves leadership, then that same side collapses.
+  leader_threshold: 0.65
+  collapse_threshold: 0.40
+
+  # Both legs must be available from the same snapshot below this fee-adjusted cost.
+  max_effective_pair_cost: 0.97
+
+  # Current crypto taker-rate fallback. The runner first tries to read a market value.
+  taker_fee_rate: 0.07
+
+  # Paper bankroll and hard per-market allocation cap.
+  starting_balance_usd: 1000.0
+  max_market_capital_usd: 100.0
+
+  # Require enough displayed best-ask size on BOTH outcomes.
+  min_pair_shares: 5.0
+  share_precision: 3
+
+  # BTC 5-minute markets should be ordinary binary markets for this pair logic.
+  require_non_neg_risk: true
+
+  results_csv: data/reversal_pair_paper.csv
